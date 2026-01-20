@@ -23,6 +23,7 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 void tile_rsqrt(float* input, float* output) {
     float x[32][128];

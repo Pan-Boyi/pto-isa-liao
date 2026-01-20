@@ -23,6 +23,7 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 void tile_muls(float* input, float* output, float scale) {
     float a[32][128];

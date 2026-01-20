@@ -24,6 +24,7 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 void flash_attn_init_state(float* input_zeros_large, float* input_zeros_small, float* input_neg_inf, float* output_o, float* output_l, float* output_m) {
     float o_init[64][128];

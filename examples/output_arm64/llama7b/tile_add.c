@@ -24,6 +24,7 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 void tile_add(float* input_a, float* input_b, float* output) {
     float a[32][128];

@@ -31,6 +31,7 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 void flash_attn_output_update(float* input_o_prev, float* input_p, float* input_v, float* input_scale, float* output_o) {
     float o_prev[64][128];

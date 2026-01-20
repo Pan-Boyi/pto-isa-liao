@@ -34,6 +34,7 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 void rmsnorm_tile(float* input, float* weights, float* output) {
     float x[32][128];

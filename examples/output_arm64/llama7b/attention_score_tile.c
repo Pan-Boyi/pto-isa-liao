@@ -25,6 +25,7 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 void attention_score_tile(float* input_q, float* input_kt, float* output) {
     float q[32][128];

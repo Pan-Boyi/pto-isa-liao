@@ -24,6 +24,7 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 void tile_rowexpandsub(float* input_x, float* input_row, float* output) {
     float x[32][128];

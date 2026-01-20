@@ -32,6 +32,7 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 void tile_silu(float* input, float* output) {
     float x[32][128];

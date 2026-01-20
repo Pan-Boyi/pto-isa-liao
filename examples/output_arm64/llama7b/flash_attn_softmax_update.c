@@ -40,6 +40,7 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 void flash_attn_softmax_update(float* input_s, float* input_m_prev, float* input_l_prev, float* output_m_new, float* output_l_new, float* output_p, float* output_scale_old) {
     float s_block[64][64];

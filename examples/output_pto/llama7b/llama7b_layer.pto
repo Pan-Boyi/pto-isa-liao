@@ -504,31 +504,31 @@ func @llama_layer_dynamic(%input: !pto.memref<gm,...,f32>, %output: !pto.memref<
   LI %tile_rows:i32, 32
   LI %zero:i32, 0
   FOR %tile_i:idx, 0:idx, %num_tiles:idx, 1:idx
-    CALL @rmsnorm_tile(%input -> %input, %weights -> %attn_norm_weights, %output -> %temp_norm)
-    CALL @tile_matmul(%input_a -> %temp_norm, %input_b -> %wq, %output -> %all_q_tiles)
-    CALL @tile_matmul(%input_a -> %temp_norm, %input_b -> %wk, %output -> %all_k_tiles)
-    CALL @tile_matmul(%input_a -> %temp_norm, %input_b -> %wv, %output -> %all_v_tiles)
-    CALL @rope_tile(%input -> %all_q_tiles, %cos_cache -> %cos_cache, %sin_cache -> %sin_cache, %output -> %all_q_rope)
-    CALL @rope_tile(%input -> %all_k_tiles, %cos_cache -> %cos_cache, %sin_cache -> %sin_cache, %output -> %all_k_rope)
+    CALL @rmsnorm_tile(%input -> (%input, tile_i, 0), %weights -> %attn_norm_weights, %output -> (%temp_norm, tile_i, 0))
+    CALL @tile_matmul(%input_a -> (%temp_norm, tile_i, 0), %input_b -> %wq, %output -> (%all_q_tiles, tile_i, 0))
+    CALL @tile_matmul(%input_a -> (%temp_norm, tile_i, 0), %input_b -> %wk, %output -> (%all_k_tiles, tile_i, 0))
+    CALL @tile_matmul(%input_a -> (%temp_norm, tile_i, 0), %input_b -> %wv, %output -> (%all_v_tiles, tile_i, 0))
+    CALL @rope_tile(%input -> (%all_q_tiles, tile_i, 0), %cos_cache -> %cos_cache, %sin_cache -> %sin_cache, %output -> (%all_q_rope, tile_i, 0))
+    CALL @rope_tile(%input -> (%all_k_tiles, tile_i, 0), %cos_cache -> %cos_cache, %sin_cache -> %sin_cache, %output -> (%all_k_rope, tile_i, 0))
   ENDFOR
   FOR %q_tile:idx, 0:idx, %num_tiles:idx, 1:idx
-    CALL @flash_attn_init_state(%input_zeros_large -> %const_zeros_large, %input_zeros_small -> %const_zeros_small, %input_neg_inf -> %const_neg_inf, %output_o -> %all_attn_out, %output_l -> %all_l_vec, %output_m -> %all_m_vec)
+    CALL @flash_attn_init_state(%input_zeros_large -> %const_zeros_large, %input_zeros_small -> %const_zeros_small, %input_neg_inf -> %const_neg_inf, %output_o -> (%all_attn_out, q_tile, 0), %output_l -> (%all_l_vec, q_tile, 0), %output_m -> (%all_m_vec, q_tile, 0))
     FOR %kv_tile:idx, 0:idx, %num_tiles:idx, 1:idx
-      CALL @flash_attn_score_block(%input_q -> %all_q_rope, %input_k -> %all_k_rope, %output_s -> %temp_scores)
-      CALL @flash_attn_softmax_update(%input_s -> %temp_scores, %input_m_prev -> %all_m_vec, %input_l_prev -> %all_l_vec, %output_m_new -> %all_m_vec, %output_l_new -> %all_l_vec, %output_p -> %temp_attn_weights, %output_scale_old -> %temp_scale)
-      CALL @flash_attn_output_update(%input_o_prev -> %all_attn_out, %input_p -> %temp_attn_weights, %input_v -> %all_v_tiles, %input_scale -> %temp_scale, %output_o -> %all_attn_out)
+      CALL @flash_attn_score_block(%input_q -> (%all_q_rope, q_tile, 0), %input_k -> (%all_k_rope, kv_tile, 0), %output_s -> (%temp_scores, q_tile, 0))
+      CALL @flash_attn_softmax_update(%input_s -> (%temp_scores, q_tile, 0), %input_m_prev -> (%all_m_vec, q_tile, 0), %input_l_prev -> (%all_l_vec, q_tile, 0), %output_m_new -> (%all_m_vec, q_tile, 0), %output_l_new -> (%all_l_vec, q_tile, 0), %output_p -> (%temp_attn_weights, q_tile, 0), %output_scale_old -> (%temp_scale, q_tile, 0))
+      CALL @flash_attn_output_update(%input_o_prev -> (%all_attn_out, q_tile, 0), %input_p -> (%temp_attn_weights, q_tile, 0), %input_v -> (%all_v_tiles, kv_tile, 0), %input_scale -> (%temp_scale, q_tile, 0), %output_o -> (%all_attn_out, q_tile, 0))
     ENDFOR
-    CALL @flash_attn_normalize(%input_o -> %all_attn_out, %input_l -> %all_l_vec, %output -> %all_attn_out)
+    CALL @flash_attn_normalize(%input_o -> (%all_attn_out, q_tile, 0), %input_l -> (%all_l_vec, q_tile, 0), %output -> (%all_attn_out, q_tile, 0))
   ENDFOR
   FOR %tile_i:idx, 0:idx, %num_tiles:idx, 1:idx
-    CALL @tile_matmul(%input_a -> %all_attn_out, %input_b -> %wo, %output -> %temp_norm)
-    CALL @residual_add_tile(%input -> %temp_norm, %input_residual -> %input, %output -> %all_hidden)
-    CALL @rmsnorm_tile(%input -> %all_hidden, %weights -> %mlp_norm_weights, %output -> %temp_norm)
-    CALL @tile_matmul(%input_a -> %temp_norm, %input_b -> %w_gate, %output -> %temp_gate)
-    CALL @tile_matmul(%input_a -> %temp_norm, %input_b -> %w_up, %output -> %temp_up)
-    CALL @swiglu_tile(%input_gate -> %temp_gate, %input_up -> %temp_up, %output -> %temp_swiglu)
-    CALL @tile_matmul(%input_a -> %temp_swiglu, %input_b -> %w_down, %output -> %temp_mlp_out)
-    CALL @residual_add_tile(%input -> %temp_mlp_out, %input_residual -> %all_hidden, %output -> %output)
+    CALL @tile_matmul(%input_a -> (%all_attn_out, tile_i, 0), %input_b -> %wo, %output -> (%temp_norm, tile_i, 0))
+    CALL @residual_add_tile(%input -> (%temp_norm, tile_i, 0), %input_residual -> (%input, tile_i, 0), %output -> (%all_hidden, tile_i, 0))
+    CALL @rmsnorm_tile(%input -> (%all_hidden, tile_i, 0), %weights -> %mlp_norm_weights, %output -> (%temp_norm, tile_i, 0))
+    CALL @tile_matmul(%input_a -> (%temp_norm, tile_i, 0), %input_b -> %w_gate, %output -> (%temp_gate, tile_i, 0))
+    CALL @tile_matmul(%input_a -> (%temp_norm, tile_i, 0), %input_b -> %w_up, %output -> (%temp_up, tile_i, 0))
+    CALL @swiglu_tile(%input_gate -> (%temp_gate, tile_i, 0), %input_up -> (%temp_up, tile_i, 0), %output -> (%temp_swiglu, tile_i, 0))
+    CALL @tile_matmul(%input_a -> (%temp_swiglu, tile_i, 0), %input_b -> %w_down, %output -> (%temp_mlp_out, tile_i, 0))
+    CALL @residual_add_tile(%input -> (%temp_mlp_out, tile_i, 0), %input_residual -> (%all_hidden, tile_i, 0), %output -> (%output, tile_i, 0))
   ENDFOR
   
   return

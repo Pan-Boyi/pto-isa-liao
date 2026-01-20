@@ -35,6 +35,7 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 void swiglu_tile(float* input_gate, float* input_up, float* output) {
     float gate[32][128];

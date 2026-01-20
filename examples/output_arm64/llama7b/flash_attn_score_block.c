@@ -25,6 +25,7 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 void flash_attn_score_block(float* input_q, float* input_k, float* output_s) {
     float q_block[64][128];

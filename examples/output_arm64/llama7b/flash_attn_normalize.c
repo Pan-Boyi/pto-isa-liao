@@ -24,6 +24,7 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 void flash_attn_normalize(float* input_o, float* input_l, float* output) {
     float o_block[64][128];

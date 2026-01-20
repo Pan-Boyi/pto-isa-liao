@@ -24,6 +24,7 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 void linear_tile(float* input, float* weight, float* output) {
     float x[32][128];

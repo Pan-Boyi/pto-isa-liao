@@ -24,6 +24,7 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 void attention_output_tile(float* input_weights, float* input_v, float* output) {
     float weights[32][128];

@@ -1003,15 +1003,22 @@ class PTOFunctionBuilder:
                     row_off = arg_val[1] if len(arg_val) > 1 else 0
                     col_off = arg_val[2] if len(arg_val) > 2 else 0
                     # Validate offset expressions (if scalar variable names)
-                    if isinstance(row_off, str) and row_off not in self.program.scalar_declarations:
-                        if not row_off.isdigit():  # Allow integer literals
+                    # Check both scalar_declarations AND symbol_table (for loop variables)
+                    if isinstance(row_off, str):
+                        is_valid = (row_off in self.program.scalar_declarations or
+                                   row_off.isdigit() or
+                                   self.symbol_table.lookup(row_off) is not None)
+                        if not is_valid:
                             raise ValidationError(
-                                f"Row offset '{row_off}' is not a declared scalar"
+                                f"Row offset '{row_off}' is not a declared scalar or loop variable"
                             )
-                    if isinstance(col_off, str) and col_off not in self.program.scalar_declarations:
-                        if not col_off.isdigit():  # Allow integer literals
+                    if isinstance(col_off, str):
+                        is_valid = (col_off in self.program.scalar_declarations or
+                                   col_off.isdigit() or
+                                   self.symbol_table.lookup(col_off) is not None)
+                        if not is_valid:
                             raise ValidationError(
-                                f"Column offset '{col_off}' is not a declared scalar"
+                                f"Column offset '{col_off}' is not a declared scalar or loop variable"
                             )
                 else:
                     tensor_name = arg_val

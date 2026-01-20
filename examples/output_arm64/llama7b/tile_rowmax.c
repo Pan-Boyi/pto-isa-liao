@@ -23,6 +23,7 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 void tile_rowmax(float* input, float* output) {
     float x[32][128];

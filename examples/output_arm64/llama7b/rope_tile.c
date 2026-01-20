@@ -31,6 +31,7 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 void rope_tile(float* input, float* cos_cache, float* sin_cache, float* output) {
     float x[32][128];
