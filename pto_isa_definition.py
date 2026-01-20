@@ -3408,16 +3408,28 @@ class ENDWHILE(ControlFlowInstruction):
 
 @dataclass
 class IF(ControlFlowInstruction):
-    """Begin a structured if-region."""
+    """
+    Begin a structured if-region.
+    
+    When bit_test is specified, the condition is (cond & bit_test) != 0.
+    This is used for binary quantization of dynamic loop bounds:
+    - Decompose loop count into sum of power-of-2
+    - Each bit controls whether that block is executed
+    - Enables fixed-count loops instead of dynamic bounds
+    """
     cond: ScalarOperand
     outputs: Optional[List[Tuple[str, ElementType]]] = None
     inputs: Optional[List[Tuple[str, ElementType]]] = None
+    bit_test: Optional[int] = None  # Power-of-2 value for bit testing
     
     @property
     def opcode(self) -> str:
         return "IF"
     
     def to_pto_as(self) -> str:
+        if self.bit_test is not None:
+            # Bit test form: IF_BIT cond, bit_value
+            return f"IF_BIT {self.cond}:i32, {self.bit_test}"
         if self.outputs and self.inputs:
             out_str = ", ".join(f"%{n}:{t.value}" for n, t in self.outputs)
             in_str = ", ".join(f"%{n}:{t.value}" for n, t in self.inputs)

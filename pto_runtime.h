@@ -27,7 +27,7 @@
 // Configuration
 // =============================================================================
 
-#define PTO_MAX_TASKS          65536   // Maximum pending tasks
+#define PTO_MAX_TASKS          262144  // Maximum pending tasks (256K for 16K+ seq)
 #define PTO_MAX_FANOUT         512     // Maximum fanout per task
 #define PTO_MAX_ARGS           16      // Maximum arguments per task
 #define PTO_TENSORMAP_SIZE     16384   // Hash table size for tensor map

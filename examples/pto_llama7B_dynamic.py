@@ -132,22 +132,24 @@ TILE_INFO = get_tile_info(DTYPE, TARGET_ISA)
 # - 128K sequence: 4096 tiles → 2048 iterations (50% reduction)
 #
 # Only the residual loop (< min_range=256) uses 32-row tiles for fine-grained handling.
+# Key 0 is a special marker for residual iterations (< min_range)
 TILE_ROWS_BY_LEVEL = {
     4096: 64,   # 128K seq: 4096 → 2048 iterations
     2048: 64,   # 64K seq: 2048 → 1024 iterations
     1024: 64,   # 32K seq: 1024 → 512 iterations  ← NOW USES 64-ROW!
     512:  64,   # 16K seq: 512 → 256 iterations   ← NOW USES 64-ROW!
     256:  64,   # 8K seq: 256 → 128 iterations    ← NOW USES 64-ROW!
+    0:    32,   # Residual (< min_range): smaller tiles for fine-grained handling
 }
-TILE_ROWS_RESIDUAL = 32  # Residual iterations (< 256 tiles): smaller tiles for flexibility
+TILE_ROWS_RESIDUAL = TILE_ROWS_BY_LEVEL[0]  # Alias for clarity
 
 # All tile variants we need to generate InCore functions for
 # Include both TILE_ROWS_BY_LEVEL values (64) and TILE_ROWS_RESIDUAL (32)
 TILE_SIZE_VARIANTS = sorted(set(TILE_ROWS_BY_LEVEL.values()) | {TILE_ROWS_RESIDUAL}, reverse=True)  # [64, 32]
 
 # Maximum number of tiles for binary-expanded loops
-# Use smallest tile size for counting (most tiles)
-MIN_TILE_ROWS = min(TILE_ROWS_BY_LEVEL.values())
+# Use smallest quantized tile size for counting (exclude key 0 which is residual)
+MIN_TILE_ROWS = min(v for k, v in TILE_ROWS_BY_LEVEL.items() if k > 0)
 MAX_NUM_TILES = MAX_SEQ_LEN // MIN_TILE_ROWS  # 131072 / 32 = 4096
 
 # Minimum block size for binary expansion (256 tiles = 8K sequence elements with 32-row tiles)
@@ -1341,92 +1343,70 @@ def create_llama_layer_dynamic(module, rows=TILE_ROWS, cols=TILE_COLS, dtype=DTY
         # ================================================================
         # PHASE 1: Pre-Attention (ALL tiles run in PARALLEL)
         # ================================================================
-        # Each tile computes Q/K/V independently - no cross-tile dependencies
-        # OFFSET: ("tensor", "tile_i", 0) - each tile processes different rows
-        # Binary expansion for dynamic seq_len up to 128K
-        # tile_levels: larger blocks use larger tiles for better throughput
+        # Simple FOR loop - compiler handles three-tier quantization:
+        #   Tier 1: Loop for full max_range blocks (n >= max_range)
+        #   Tier 2: IF_BIT predicates for [min_range, max_range)
+        #   Tier 3: Single tail call for residual < min_range
         .for_loop("tile_i", 0, "num_tiles", 1, 
                   max_range=MAX_NUM_TILES, min_range=MIN_NUM_TILES,
                   tile_levels=TILE_ROWS_BY_LEVEL)
-            # ============================================================
-            # Phase 1: Pre-Attention for tile_i (independent of other tiles)
-            # ============================================================
-            
-            # RMSNorm on input[tile_i]
             .call("rmsnorm_tile", {
-                "input": ("input", "tile_i", 0),           # input[tile_i]
-                "weights": "attn_norm_weights",            # Shared weights
-                "output": ("temp_norm", "tile_i", 0)       # temp_norm[tile_i]
+                "input": ("input", "tile_i", 0),
+                "weights": "attn_norm_weights",
+                "output": ("temp_norm", "tile_i", 0)
             })
-            
-            # Q, K, V projections (3 matmuls, all independent)
             .call("tile_matmul", {
                 "input_a": ("temp_norm", "tile_i", 0),
-                "input_b": "wq",                           # Shared weights
-                "output": ("all_q_tiles", "tile_i", 0)     # Q[tile_i]
+                "input_b": "wq",
+                "output": ("all_q_tiles", "tile_i", 0)
             })
             .call("tile_matmul", {
                 "input_a": ("temp_norm", "tile_i", 0),
                 "input_b": "wk",
-                "output": ("all_k_tiles", "tile_i", 0)     # K[tile_i]
+                "output": ("all_k_tiles", "tile_i", 0)
             })
             .call("tile_matmul", {
                 "input_a": ("temp_norm", "tile_i", 0),
                 "input_b": "wv",
-                "output": ("all_v_tiles", "tile_i", 0)     # V[tile_i]
-            })
-            
-            # RoPE on Q and K (independent)
-            .call("rope_tile", {
-                "input": ("all_q_tiles", "tile_i", 0),     # Q[tile_i]
-                "cos_cache": "cos_cache",
-                "sin_cache": "sin_cache",
-                "output": ("all_q_rope", "tile_i", 0)      # Q_rope[tile_i]
+                "output": ("all_v_tiles", "tile_i", 0)
             })
             .call("rope_tile", {
-                "input": ("all_k_tiles", "tile_i", 0),     # K[tile_i]
+                "input": ("all_q_tiles", "tile_i", 0),
                 "cos_cache": "cos_cache",
                 "sin_cache": "sin_cache",
-                "output": ("all_k_rope", "tile_i", 0)      # K_rope[tile_i]
+                "output": ("all_q_rope", "tile_i", 0)
             })
-        .end_for()  # End Phase 1
+            .call("rope_tile", {
+                "input": ("all_k_tiles", "tile_i", 0),
+                "cos_cache": "cos_cache",
+                "sin_cache": "sin_cache",
+                "output": ("all_k_rope", "tile_i", 0)
+            })
+        .end_for()
         
         # ================================================================
         # PHASE 2: Flash Attention (CROSS-TILE dependencies)
         # ================================================================
-        # For each Q tile, we must attend to ALL K,V tiles
-        # This creates the "fan-in" dependency: Q[i] depends on all K[j], V[j]
-        # OFFSET: Q uses "q_tile", K/V uses "kv_tile" - creates N*N cross-tile deps
-        # Binary expansion for dynamic seq_len up to 128K
         .for_loop("q_tile", 0, "num_tiles", 1, 
                   max_range=MAX_NUM_TILES, min_range=MIN_NUM_TILES,
                   tile_levels=TILE_ROWS_BY_LEVEL)
-            # Initialize attention state for this Q tile
             .call("flash_attn_init_state", {
                 "input_zeros_large": "const_zeros_large",
                 "input_zeros_small": "const_zeros_small",
                 "input_neg_inf": "const_neg_inf",
-                "output_o": ("all_attn_out", "q_tile", 0),   # O[q_tile]
-                "output_l": ("all_l_vec", "q_tile", 0),      # L[q_tile]
-                "output_m": ("all_m_vec", "q_tile", 0)       # M[q_tile]
+                "output_o": ("all_attn_out", "q_tile", 0),
+                "output_l": ("all_l_vec", "q_tile", 0),
+                "output_m": ("all_m_vec", "q_tile", 0)
             })
             
-            # ============================================================
-            # Inner Loop: Q[q_tile] attends to ALL K,V tiles
-            # This creates cross-tile dependencies!
-            # Binary expansion for dynamic seq_len up to 128K
-            # ============================================================
             .for_loop("kv_tile", 0, "num_tiles", 1, 
                       max_range=MAX_NUM_TILES, min_range=MIN_NUM_TILES,
                       tile_levels=TILE_ROWS_BY_LEVEL)
-                # Compute S[q_tile, kv_tile] = Q_rope[q_tile] @ K_rope[kv_tile].T
                 .call("flash_attn_score_block", {
-                    "input_q": ("all_q_rope", "q_tile", 0),  # Q_rope[q_tile]
-                    "input_k": ("all_k_rope", "kv_tile", 0), # K_rope[kv_tile] ← CROSS-TILE!
+                    "input_q": ("all_q_rope", "q_tile", 0),
+                    "input_k": ("all_k_rope", "kv_tile", 0),
                     "output_s": ("temp_scores", "q_tile", 0)
                 })
-                
-                # Online softmax update
                 .call("flash_attn_softmax_update", {
                     "input_s": ("temp_scores", "q_tile", 0),
                     "input_m_prev": ("all_m_vec", "q_tile", 0),
@@ -1436,24 +1416,21 @@ def create_llama_layer_dynamic(module, rows=TILE_ROWS, cols=TILE_COLS, dtype=DTY
                     "output_p": ("temp_attn_weights", "q_tile", 0),
                     "output_scale_old": ("temp_scale", "q_tile", 0)
                 })
-                
-                # Accumulate: O[q_tile] += scale * P @ V[kv_tile]
                 .call("flash_attn_output_update", {
                     "input_o_prev": ("all_attn_out", "q_tile", 0),
                     "input_p": ("temp_attn_weights", "q_tile", 0),
-                    "input_v": ("all_v_tiles", "kv_tile", 0),  # V[kv_tile] ← CROSS-TILE!
+                    "input_v": ("all_v_tiles", "kv_tile", 0),
                     "input_scale": ("temp_scale", "q_tile", 0),
                     "output_o": ("all_attn_out", "q_tile", 0)
                 })
-            .end_for()  # End kv_tile loop
+            .end_for()
             
-            # Normalize: O[q_tile] = O[q_tile] / L[q_tile]
             .call("flash_attn_normalize", {
                 "input_o": ("all_attn_out", "q_tile", 0),
                 "input_l": ("all_l_vec", "q_tile", 0),
                 "output": ("all_attn_out", "q_tile", 0)
             })
-        .end_for()  # End q_tile loop (Phase 2)
+        .end_for()
         
         # ================================================================
         # PHASE 3: Post-Attention (depends on Phase 2 completion)
@@ -1896,27 +1873,21 @@ def main():
     print(f"\nEntry: {module.entry_function}")
     
     # =========================================================================
-    # Generate for seq_len=16384 (16K) to demonstrate adaptive tile optimization
+    # Generate for seq_len=573 to demonstrate three-tier quantization
     # =========================================================================
-    # With 16K sequence: num_tiles = 16384/32 = 512 base-tiles
-    # Binary: 512 = 0b1000000000 → hits 512-block
-    # tile_levels[512] = 64 → scale=2x → actual_iters = 512/2 = 256
-    # This gives 50% reduction in iterations!
+    # num_tiles = 573 // 32 = 17 full tiles
+    # Binary decomposition of 17: 16 + 1 = 0b10001
+    # 
+    # Three-tier processing:
+    # - Tier 1: full_blocks = 17 / 4096 = 0 (no full max_range blocks)
+    # - Tier 2: IF_BIT for [256, 4096) - none hit (17 < 256)
+    # - Tier 3: residual = 17 (all processed as residual)
     #
-    # Task count analysis (with adaptive tiles):
-    # - Phase 1 (Pre-Attention): 6 tasks × 256 iters = 1,536 tasks
-    # - Phase 2 (Flash Attention): ~256² = 65,536 score blocks → with adaptive: 128² = 16,384
-    # - Phase 3 (FFN): 6 tasks × 256 iters = 1,536 tasks
-    # Total: ~19,456 tasks (vs ~78,848 without optimization = 75% reduction!)
-    seq_len = 16384  # 16K sequence length
+    # This demonstrates the tail handling with small sequences
+    seq_len = 573  # Small sequence for quick PDF generation
     
-    # Use demo limit of 256 tiles to verify optimization
-    # 256 >= min_range, so adaptive tiles kick in:
-    # - Binary: 256 = 0b100000000 → hits 256-block
-    # - tile_levels[256] = 64 → scale=2x → actual_iters = 256/2 = 128
-    # Without optimization: 256 tiles → 256 iterations
-    # With optimization: 256 tiles → 128 iterations (50% reduction!)
-    generate_for_seq_len(module, seq_len, output_base, incore_funcs, max_tiles_for_demo=256)
+    # Use actual num_tiles (17) for demo
+    generate_for_seq_len(module, seq_len, output_base, incore_funcs, max_tiles_for_demo=17)
     
     # ==========================================================================
     # Summary

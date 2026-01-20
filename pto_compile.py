@@ -937,6 +937,57 @@ class PTOFunctionBuilder:
         self._loop_stack.append([])  # Reuse loop stack for IF body
         return self
     
+    def if_bit(self, scalar_name: str, bit_value: int) -> "PTOFunctionBuilder":
+        """
+        Begin an IF block that tests if a specific bit is set.
+        
+        Generates: if (scalar_name & bit_value)
+        
+        Args:
+            scalar_name: Name of the scalar variable to test
+            bit_value: Power-of-2 value to test (must be power of 2)
+        
+        Example:
+            .if_bit("num_tiles", 4096)  # if (num_tiles & 4096) != 0
+                .call("process_4096_block", {...})
+            .end_if()
+        
+        This is used for binary quantization of dynamic loop bounds:
+        - Decompose num_tiles into sum of power-of-2
+        - Each bit controls whether that block is executed
+        - Enables fixed-count loops instead of dynamic bounds
+        """
+        # Validate bit_value is power of 2
+        if bit_value <= 0 or (bit_value & (bit_value - 1)) != 0:
+            raise ValidationError(f"bit_value must be a positive power of 2, got {bit_value}")
+        
+        # Create a temporary scalar for the bit test result
+        test_name = f"_bit_test_{scalar_name}_{bit_value}"
+        if test_name not in self.program.scalar_declarations:
+            self.program.add_scalar(test_name, ElementType.I32)
+        
+        # Generate: test = scalar & bit_value
+        # We'll use a SCMP with mode to check if bit is set
+        # For simplicity, we'll generate an AND and compare to non-zero
+        # But since we don't have AND instruction, we use integer division trick:
+        # (scalar / bit_value) % 2 == 1 means bit is set
+        
+        # Actually, let's use a different approach: add special IF_BIT instruction
+        # or use the existing comparison with bit test semantics
+        self.symbol_table.push_scope()
+        
+        # Mark this as a bit-test IF
+        self._add_instr(IF(
+            cond=ScalarOperand(scalar_name),
+            bit_test=bit_value  # Extended attribute for bit testing
+        ))
+        self._loop_stack.append([])
+        return self
+    
+    def end_if(self) -> "PTOFunctionBuilder":
+        """End IF block (alias for endif)."""
+        return self.endif()
+    
     def else_block(self) -> "PTOFunctionBuilder":
         """Begin ELSE block."""
         if not self._loop_stack:
@@ -2631,10 +2682,19 @@ def convert_program_to_mock_instructions(program):
                 operands=[]
             ))
         elif opcode == "IF":
-            mock_instructions.append(MockInstruction(
-                opcode="IF", dst="",
-                operands=[instr.cond.name]
-            ))
+            # Check if this is a bit-test IF
+            bit_test = getattr(instr, 'bit_test', None)
+            if bit_test is not None:
+                # IF_BIT: condition is (cond & bit_value) != 0
+                mock_instructions.append(MockInstruction(
+                    opcode="IF_BIT", dst="",
+                    operands=[instr.cond.name, str(bit_test)]
+                ))
+            else:
+                mock_instructions.append(MockInstruction(
+                    opcode="IF", dst="",
+                    operands=[instr.cond.name]
+                ))
         elif opcode == "ELSE":
             mock_instructions.append(MockInstruction(
                 opcode="ELSE", dst="",
@@ -2687,43 +2747,57 @@ def convert_program_to_mock_instructions(program):
 
 def apply_binary_expansion(code: str) -> str:
     """
-    Apply binary expansion transformation to loops marked with @BINARY_EXPAND.
+    Apply THREE-TIER binary expansion transformation to loops marked with @BINARY_EXPAND.
+    
+    Three-Tier Processing:
+        Tier 1: Loop for full max_range blocks (when n >= max_range)
+        Tier 2: IF_BIT predicates for [min_range, max_range) range
+        Tier 3: Single residual loop for < min_range
+    
+    Example: n = 5000, max_range = 4096, min_range = 256
+        Tier 1: 5000 / 4096 = 1 → loop 1 time with max_range batch
+        Tier 2: 5000 % 4096 = 904 → IF_BIT for 512, 256 (904 = 512 + 256 + 136)
+        Tier 3: 904 & 255 = 136 → residual loop with 136 iterations
     
     Transforms:
-        // @BINARY_EXPAND: max_range=4096, min_range=256, bits=[4096,2048,1024,512,256]
+        // @BINARY_EXPAND: max_range=4096, min_range=256, bits=[2048,1024,512,256]
         for (int i = 0; i < n; i += 1) {
             BODY
         }
     
     Into:
         {
-            int _i_base = 0;
             int _i_limit = n;
-            int _i_residual = n & (min_range - 1);  // e.g., n & 255 for min_range=256
-            int _i_quantized = n - _i_residual;     // Quantized to min_range boundary
+            int _i_base_rows = 0;
             
-            // Binary-expanded loops for quantized portion
-            if (_i_quantized & 4096) { for (int i = _i_base; i < _i_base + 4096; i += 1) { BODY } _i_base += 4096; }
-            if (_i_quantized & 2048) { for (int i = _i_base; i < _i_base + 2048; i += 1) { BODY } _i_base += 2048; }
+            // Tier 1: Loop for full max_range blocks
+            int _i_full_blocks = _i_limit / max_range;
+            int _i_partial = _i_limit % max_range;
+            for (int _block = 0; _block < _i_full_blocks; _block++) {
+                for (int i = 0; i < actual_iters_max; i += 1) {
+                    BODY with offset = _i_base_rows + i * scale_max
+                }
+                _i_base_rows += max_range;
+            }
+            
+            // Tier 2: IF_BIT for [min_range, max_range)
+            int _i_residual = _i_partial & (min_range - 1);
+            int _i_quantized = _i_partial - _i_residual;
+            if (_i_quantized & 2048) { ... _i_base_rows += 2048; }
+            if (_i_quantized & 1024) { ... _i_base_rows += 1024; }
             ...
-            if (_i_quantized & 256) { for (int i = _i_base; i < _i_base + 256; i += 1) { BODY } _i_base += 256; }
             
-            // Residual loop for remaining iterations (< min_range)
-            for (int i = _i_base; i < _i_base + _i_residual; i += 1) { BODY }
+            // Tier 3: Residual for < min_range
+            if (_i_residual > 0) {
+                for (int i = 0; i < _i_residual; i += 1) { BODY }
+            }
         }
     
-    This quantizes the dynamic loop limit into sum of power-of-2 series.
-    Each binary bit serves as a predicate to select the loop body for that power-of-2.
-    Iterations below min_range are handled by a single residual loop.
-    
-    When tile_levels is specified (e.g., tile_levels={4096:64,2048:64,1024:32,...}),
-    the iteration count is REDUCED when using larger tiles:
-    - 4096-block with 64-row tiles: iterations = 4096 * 32 / 64 = 2048 (halved!)
-    - 256-block with 32-row tiles: iterations = 256 * 32 / 32 = 256 (unchanged)
-    
-    This dramatically reduces the task graph size for large sequences:
-    - 16K seq with fixed 32-row tiles: 16*512 + 3*512^2 = 794,624 tasks
-    - 16K seq with adaptive tiles: 16*256 + 3*256^2 = 200,704 tasks (75% reduction!)
+    Benefits:
+    - Tier 1: Handles unbounded n > max_range via simple loop
+    - Tier 2: Fixed-count blocks with predicated selection (no dynamic bounds!)
+    - Tier 3: Single tail call for small residual
+    - Adaptive tile sizes reduce iteration counts dramatically
     """
     import re
     
@@ -2731,15 +2805,24 @@ def apply_binary_expansion(code: str) -> str:
     DEFAULT_TILE_ROWS = 32
     
     def transform_func_names(body_lines: list, tile_rows: int) -> list:
-        """Transform function names in body to use tile_rows variant."""
+        """Transform function names and tile shapes in body to use tile_rows variant.
+        
+        When using larger tiles (e.g., 64 instead of 32):
+        1. Transform function names: func_name -> func_name_64
+        2. Transform tile shapes in pto_task_add_input/output: (32, 128) -> (64, 128)
+        """
         if tile_rows == DEFAULT_TILE_ROWS:
             return body_lines  # No transformation needed for standard size
         
         # Pattern to match function calls: pto_task_alloc(rt, "func_name", ...)
-        # We need to replace "func_name" with "func_name_N"
-        result = []
         func_pattern = re.compile(r'pto_task_alloc\(rt, "([^"]+)"')
         
+        # Pattern to match tile shapes: pto_task_add_input/output(rt, task_id, tensor, row_off, col_off, ROWS, COLS);
+        # Format has 5 arguments before rows,cols: rt, task_id, tensor, row_off, col_off
+        # We want to replace rows from DEFAULT_TILE_ROWS (32) with tile_rows (64)
+        shape_pattern = re.compile(r'(pto_task_add_(?:input|output)\([^,]+,[^,]+,[^,]+,[^,]+,[^,]+,\s*)(\d+)(,\s*)(\d+)(\);)')
+        
+        result = []
         for line in body_lines:
             # Replace function names in pto_task_alloc calls
             def replace_func(m):
@@ -2753,6 +2836,21 @@ def apply_binary_expansion(code: str) -> str:
                 return f'pto_task_alloc(rt, "{func_name}_{tile_rows}"'
             
             new_line = func_pattern.sub(replace_func, line)
+            
+            # Replace tile shapes in pto_task_add_input/output calls
+            # Change rows from DEFAULT_TILE_ROWS to tile_rows
+            def replace_shape(m):
+                prefix = m.group(1)
+                old_rows = int(m.group(2))
+                comma = m.group(3)
+                cols = m.group(4)
+                suffix = m.group(5)
+                # Only transform if old_rows matches DEFAULT_TILE_ROWS
+                if old_rows == DEFAULT_TILE_ROWS:
+                    return f'{prefix}{tile_rows}{comma}{cols}{suffix}'
+                return m.group(0)
+            
+            new_line = shape_pattern.sub(replace_shape, new_line)
             result.append(new_line)
         
         return result
@@ -2839,27 +2937,59 @@ def apply_binary_expansion(code: str) -> str:
                     body_lines.append(body_line)
                 i += 1
             
-            # Generate binary-expanded code with ADAPTIVE ITERATION COUNTS
+            # Generate THREE-TIER binary-expanded code
             tile_info = f" (tile_levels: {tile_levels})" if tile_levels else ""
-            result.append(f"{ind}// Binary-expanded loop with ADAPTIVE tile sizes: {ub}{tile_info}")
-            result.append(f"{ind}// Larger tiles → fewer iterations → smaller task graph!")
+            result.append(f"{ind}// THREE-TIER Binary Expansion: {ub}{tile_info}")
+            result.append(f"{ind}// Tier 1: Loop for n >= max_range | Tier 2: IF_BIT for [min,max) | Tier 3: Residual")
             result.append(f"{ind}{{")
-            result.append(f"{ind}    int _{iv}_base = {lb};")
             result.append(f"{ind}    int _{iv}_limit = {ub};")
-            
-            # For adaptive tiles, we need to track how many "base-sized" tiles we've processed
-            # When using 64-row tiles instead of 32-row, each iteration covers 2 base tiles
             result.append(f"{ind}    int _{iv}_base_rows = 0;  // Track rows processed in base tile units")
             result.append(f"")
             
-            # Calculate residual and quantized portions (in base tile units)
-            result.append(f"{ind}    int _{iv}_residual = _{iv}_limit & {min_range - 1};  // Residual base-tiles < {min_range}")
-            result.append(f"{ind}    int _{iv}_quantized = _{iv}_limit - _{iv}_residual;  // Quantized to {min_range} boundary")
+            # ================================================================
+            # TIER 1: Loop for full max_range blocks (handles n >= max_range)
+            # ================================================================
+            max_tile_rows = tile_levels.get(max_range, DEFAULT_TILE_ROWS) if tile_levels else DEFAULT_TILE_ROWS
+            max_scale = max_tile_rows // DEFAULT_TILE_ROWS
+            max_actual_iters = max_range // max_scale
+            
+            result.append(f"{ind}    // TIER 1: Loop for full max_range ({max_range}) blocks")
+            result.append(f"{ind}    // tile_rows={max_tile_rows}, scale={max_scale}x, actual_iters={max_actual_iters}")
+            result.append(f"{ind}    int _{iv}_full_blocks = _{iv}_limit / {max_range};")
+            result.append(f"{ind}    int _{iv}_partial = _{iv}_limit % {max_range};  // Goes to Tier 2 & 3")
+            result.append(f"{ind}    for (int _{iv}_block = 0; _{iv}_block < _{iv}_full_blocks; _{iv}_block++) {{")
+            result.append(f"{ind}        for (int {iv} = 0; {iv} < {max_actual_iters}; {iv} += {step}) {{")
+            result.append(f"{ind}            int _{iv}_row_offset = _{iv}_base_rows + ({iv} * {max_scale});")
+            
+            # Transform and add body for Tier 1
+            transformed_body = transform_func_names(body_lines, max_tile_rows)
+            processed_body = []
+            for body_line in transformed_body:
+                modified_line = body_line.replace(f', {iv},', f', _{iv}_row_offset,')
+                processed_body.append(f"        {modified_line}")
+            
+            body_code = '\n'.join(processed_body)
+            expanded_body = apply_binary_expansion(body_code)
+            for body_line in expanded_body.split('\n'):
+                result.append(body_line)
+            
+            result.append(f"{ind}        }}")
+            result.append(f"{ind}        _{iv}_base_rows += {max_range};")
+            result.append(f"{ind}    }}")
             result.append(f"")
             
-            # Generate binary-expanded loops for quantized portion
-            result.append(f"{ind}    // Power-of-2 blocks with adaptive iteration counts:")
-            for p2 in bits:
+            # ================================================================
+            # TIER 2: IF_BIT for [min_range, max_range) range
+            # ================================================================
+            result.append(f"{ind}    // TIER 2: IF_BIT predicates for [min_range, max_range)")
+            result.append(f"{ind}    int _{iv}_residual = _{iv}_partial & {min_range - 1};  // Tier 3 residual")
+            result.append(f"{ind}    int _{iv}_quantized = _{iv}_partial - _{iv}_residual;  // For IF_BIT")
+            result.append(f"")
+            
+            # Filter bits to only include those in [min_range, max_range)
+            tier2_bits = [b for b in bits if min_range <= b < max_range]
+            
+            for p2 in tier2_bits:
                 # Get tile size for this block
                 tile_rows = tile_levels.get(p2, DEFAULT_TILE_ROWS) if tile_levels else DEFAULT_TILE_ROWS
                 scale = tile_rows // DEFAULT_TILE_ROWS
@@ -2892,10 +3022,13 @@ def apply_binary_expansion(code: str) -> str:
                 result.append(f"{ind}        _{iv}_base_rows += {p2};  // Advance by {p2} base-tiles")
                 result.append(f"{ind}    }}")
             
-            # Generate residual loop (uses default/smallest tile size)
-            residual_tile_rows = min(tile_levels.values()) if tile_levels else DEFAULT_TILE_ROWS
+            # ================================================================
+            # TIER 3: Residual loop for < min_range
+            # ================================================================
+            # Use tile_levels[0] if specified (special key for residual), else use DEFAULT_TILE_ROWS
+            residual_tile_rows = tile_levels.get(0, DEFAULT_TILE_ROWS) if tile_levels else DEFAULT_TILE_ROWS
             result.append(f"")
-            result.append(f"{ind}    // Residual loop for remaining iterations < {min_range} (tile_rows={residual_tile_rows})")
+            result.append(f"{ind}    // TIER 3: Residual loop for < {min_range} iterations (tile_rows={residual_tile_rows})")
             result.append(f"{ind}    if (_{iv}_residual > 0) {{")
             result.append(f"{ind}        for (int {iv} = 0; {iv} < _{iv}_residual; {iv} += {step}) {{")
             result.append(f"{ind}            int _{iv}_row_offset = _{iv}_base_rows + {iv};  // Offset in base-tile units")
@@ -2935,10 +3068,13 @@ class OrchestrationContext:
     - Task counter for unique IDs
     - Tensor to producer task mapping for dependency tracking
     - Module reference for InCore function metadata
+    - Default tile dimensions for code generation
     """
     module: Optional['PTOModule'] = None
     task_counter: int = 0
     tensor_producers: Dict[str, int] = field(default_factory=dict)
+    default_tile_rows: int = 32   # Default tile rows (can be overridden)
+    default_tile_cols: int = 128  # Default tile cols (can be overridden)
     
     def alloc_task(self) -> int:
         """Allocate a new task ID."""
@@ -2955,6 +3091,10 @@ class OrchestrationContext:
         if self.module:
             return self.module.get_buffer_size(func_name)
         return (0.0, 0.0)
+    
+    def get_default_tile_shape(self) -> Tuple[int, int]:
+        """Get default tile shape (rows, cols)."""
+        return (self.default_tile_rows, self.default_tile_cols)
 
 
 def _gen_arm64_barrier_op(instr, rows, cols, dtype, tile_info, orch_ctx: Optional[OrchestrationContext] = None):
@@ -3093,6 +3233,12 @@ def _gen_arm64_barrier_op(instr, rows, cols, dtype, tile_info, orch_ctx: Optiona
     elif instr.opcode == "IF":
         cond = instr.operands[0] if instr.operands else "true"
         lines.append(f"if ({cond}) {{")
+    
+    elif instr.opcode == "IF_BIT":
+        # Bit-test IF: if (cond & bit_value) != 0
+        cond = instr.operands[0] if len(instr.operands) > 0 else "0"
+        bit_value = instr.operands[1] if len(instr.operands) > 1 else "0"
+        lines.append(f"if ({cond} & {bit_value}) {{")
         
     elif instr.opcode == "ELSE":
         lines.append("} else {")
@@ -3956,8 +4102,11 @@ class MultiBackendCodeGenerator:
                 elif isinstance(item, FusionBarrier):
                     instr = item.raw_instr
                     info = tile_info.get(instr.dst) if instr.dst else None
-                    rows = info.rows if info else 8
-                    cols = info.cols if info else 8
+                    # Use OrchestrationContext defaults if available, else standard tile size
+                    default_rows = orch_ctx.default_tile_rows if orch_ctx else 32
+                    default_cols = orch_ctx.default_tile_cols if orch_ctx else 128
+                    rows = info.rows if info else default_rows
+                    cols = info.cols if info else default_cols
                     dtype = info.dtype if info else "f32"
                     
                     # Handle indentation changes for control flow
@@ -4073,8 +4222,9 @@ class MultiBackendCodeGenerator:
                 elif isinstance(item, FusionBarrier):
                     instr = item.raw_instr
                     info = tile_info.get(instr.dst) if instr.dst else None
-                    rows = info.rows if info else 8
-                    cols = info.cols if info else 8
+                    # Use standard tile size defaults for CUDA
+                    rows = info.rows if info else 32
+                    cols = info.cols if info else 128
                     dtype = info.dtype if info else "f32"
                     
                     # Handle indentation changes for control flow
@@ -4184,8 +4334,9 @@ class MultiBackendCodeGenerator:
                 elif isinstance(item, FusionBarrier):
                     instr = item.raw_instr
                     info = tile_info.get(instr.dst) if instr.dst else None
-                    rows = info.rows if info else 8
-                    cols = info.cols if info else 8
+                    # Use standard tile size defaults for Ascend
+                    rows = info.rows if info else 32
+                    cols = info.cols if info else 128
                     dtype = info.dtype if info else "f32"
                     
                     # Handle indentation changes for control flow
@@ -4622,17 +4773,21 @@ class RuntimeCodeGenerator:
     
     def _infer_shape_from_callee(self, callee_name: str, param_name: str, is_output: bool) -> Tuple[int, int]:
         """Infer tensor shape based on callee function and parameter name."""
+        # Default tile dimensions (standard for Ascend 910B F32)
+        default_rows, default_cols = 32, 128
+        
         # Reduction functions output row vectors
-        if callee_name in ['rowmax', 'rowsum'] and is_output:
-            return (8, 1)
+        if callee_name in ['rowmax', 'rowsum', 'tile_rowmax', 'tile_rowsum'] and is_output:
+            return (default_rows, 1)
         
         # Row operation functions: input_row is a row vector
-        if callee_name in ['rowexpandsub', 'rowexpanddiv', 'rowexpandmul']:
+        if callee_name in ['rowexpandsub', 'rowexpanddiv', 'rowexpandmul',
+                          'tile_rowexpandsub', 'tile_rowexpanddiv', 'tile_rowexpandmul']:
             if 'row' in param_name.lower() and 'input' in param_name.lower():
-                return (8, 1)
+                return (default_rows, 1)
         
         # Default to full tile
-        return (8, 8)
+        return (default_rows, default_cols)
     
     def generate_main_wrapper(self, entry_func: str) -> str:
         """Generate a main() function that initializes runtime and calls entry function."""

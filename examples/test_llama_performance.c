@@ -73,41 +73,52 @@ static inline int emit_cross_tile_task(PTORuntime* rt, const char* func_name,
 /**
  * Build task graph for LLaMA layer with given number of tiles.
  * Uses the correct 3-phase structure with cross-tile dependencies.
+ * 
+ * WITH ADAPTIVE TILE OPTIMIZATION:
+ * - 64-row tiles (scale = 2x) → iteration count halved
+ * - actual_iters = num_tiles / 2
  */
 void build_llama_task_graph(PTORuntime* rt, int num_tiles) {
+    // WITH ADAPTIVE TILES: iterations are halved (64-row tiles vs 32-row base)
+    int actual_iters = num_tiles / 2;  // Scale = 2x
+    int scale = 2;  // 64 rows / 32 rows
+    
     int task_idx = 0;
     
     // ================================================================
     // PHASE 1: Pre-Attention (ALL tiles parallel)
+    // With adaptive: actual_iters iterations
     // ================================================================
-    for (int tile_i = 0; tile_i < num_tiles; tile_i++) {
-        int row_offset = tile_i * TILE_ROWS;
+    for (int tile_i = 0; tile_i < actual_iters; tile_i++) {
+        // Offset is scaled by 2 to cover the same memory region
+        int row_offset = tile_i * TILE_ROWS * scale;
         
         // RMSNorm
-        emit_task(rt, "rmsnorm_tile", tile_i, row_offset, input, attn_norm_weights, temp_norm);
+        emit_task(rt, "rmsnorm_tile_64", tile_i, row_offset, input, attn_norm_weights, temp_norm);
         
         // Q, K, V matmuls
-        emit_task(rt, "tile_matmul", tile_i, row_offset, temp_norm, wq, all_q_tiles);
-        emit_task(rt, "tile_matmul", tile_i, row_offset, temp_norm, wk, all_k_tiles);
-        emit_task(rt, "tile_matmul", tile_i, row_offset, temp_norm, wv, all_v_tiles);
+        emit_task(rt, "tile_matmul_64", tile_i, row_offset, temp_norm, wq, all_q_tiles);
+        emit_task(rt, "tile_matmul_64", tile_i, row_offset, temp_norm, wk, all_k_tiles);
+        emit_task(rt, "tile_matmul_64", tile_i, row_offset, temp_norm, wv, all_v_tiles);
         
         // RoPE
-        emit_task(rt, "rope_tile", tile_i, row_offset, all_q_tiles, cos_cache, all_q_rope);
-        emit_task(rt, "rope_tile", tile_i, row_offset, all_k_tiles, cos_cache, all_k_rope);
+        emit_task(rt, "rope_tile_64", tile_i, row_offset, all_q_tiles, cos_cache, all_q_rope);
+        emit_task(rt, "rope_tile_64", tile_i, row_offset, all_k_tiles, cos_cache, all_k_rope);
     }
     
     // ================================================================
     // PHASE 2: Flash Attention (CROSS-TILE dependencies)
+    // With adaptive: actual_iters × actual_iters iterations (halved in both dimensions!)
     // ================================================================
-    for (int q_tile = 0; q_tile < num_tiles; q_tile++) {
-        int q_offset = q_tile * TILE_ROWS;
+    for (int q_tile = 0; q_tile < actual_iters; q_tile++) {
+        int q_offset = q_tile * TILE_ROWS * scale;
         
         // Initialize attention state
         emit_task(rt, "flash_attn_init_state", q_tile, q_offset, const_zeros_large, NULL, all_attn_out);
         
-        // Inner loop: Q[q_tile] attends to ALL K,V tiles
-        for (int kv_tile = 0; kv_tile < num_tiles; kv_tile++) {
-            int kv_offset = kv_tile * TILE_ROWS;
+        // Inner loop: Q[q_tile] attends to ALL K,V tiles (ALSO HALVED!)
+        for (int kv_tile = 0; kv_tile < actual_iters; kv_tile++) {
+            int kv_offset = kv_tile * TILE_ROWS * scale;
             
             // Score: S = Q[q] @ K[kv].T (CROSS-TILE!)
             emit_cross_tile_task(rt, "flash_attn_score_block", 
@@ -130,31 +141,32 @@ void build_llama_task_graph(PTORuntime* rt, int num_tiles) {
     
     // ================================================================
     // PHASE 3: Post-Attention (depends on Phase 2 completion)
+    // With adaptive: actual_iters iterations
     // ================================================================
-    for (int tile_i = 0; tile_i < num_tiles; tile_i++) {
-        int row_offset = tile_i * TILE_ROWS;
+    for (int tile_i = 0; tile_i < actual_iters; tile_i++) {
+        int row_offset = tile_i * TILE_ROWS * scale;
         
         // Output projection
-        emit_task(rt, "tile_matmul", tile_i, row_offset, all_attn_out, wo, temp_norm);
+        emit_task(rt, "tile_matmul_64", tile_i, row_offset, all_attn_out, wo, temp_norm);
         
         // Residual
-        emit_task(rt, "residual_add_tile", tile_i, row_offset, temp_norm, input, all_hidden);
+        emit_task(rt, "residual_add_tile_64", tile_i, row_offset, temp_norm, input, all_hidden);
         
         // MLP RMSNorm
-        emit_task(rt, "rmsnorm_tile", tile_i, row_offset, all_hidden, mlp_norm_weights, temp_norm);
+        emit_task(rt, "rmsnorm_tile_64", tile_i, row_offset, all_hidden, mlp_norm_weights, temp_norm);
         
         // Gate and Up
-        emit_task(rt, "tile_matmul", tile_i, row_offset, temp_norm, w_gate, temp_gate);
-        emit_task(rt, "tile_matmul", tile_i, row_offset, temp_norm, w_up, temp_up);
+        emit_task(rt, "tile_matmul_64", tile_i, row_offset, temp_norm, w_gate, temp_gate);
+        emit_task(rt, "tile_matmul_64", tile_i, row_offset, temp_norm, w_up, temp_up);
         
         // SwiGLU
-        emit_task(rt, "swiglu_tile", tile_i, row_offset, temp_gate, temp_up, temp_swiglu);
+        emit_task(rt, "swiglu_tile_64", tile_i, row_offset, temp_gate, temp_up, temp_swiglu);
         
         // Down
-        emit_task(rt, "tile_matmul", tile_i, row_offset, temp_swiglu, w_down, temp_mlp_out);
+        emit_task(rt, "tile_matmul_64", tile_i, row_offset, temp_swiglu, w_down, temp_mlp_out);
         
         // Final residual
-        emit_task(rt, "residual_add_tile", tile_i, row_offset, temp_mlp_out, all_hidden, output);
+        emit_task(rt, "residual_add_tile_64", tile_i, row_offset, temp_mlp_out, all_hidden, output);
     }
 }
 
@@ -168,13 +180,27 @@ double get_time_ms() {
 }
 
 /**
- * Calculate expected task count for N tiles
- * Phase 1: N * 6 tasks
- * Phase 2: N * (1 + N*3 + 1) = N * (2 + 3N) tasks
- * Phase 3: N * 8 tasks
- * Total: 6N + 2N + 3N^2 + 8N = 16N + 3N^2
+ * Calculate expected task count for N tiles WITH ADAPTIVE TILE OPTIMIZATION
+ * 
+ * With 64-row tiles (scale = 2x), iteration count is halved:
+ * - actual_iters = num_tiles / 2
+ * 
+ * Phase 1: actual_iters * 6 tasks = (N/2) * 6
+ * Phase 2: actual_iters * (1 + actual_iters*3 + 1) = (N/2)^2 * 4 (approximately)
+ * Phase 3: actual_iters * 8 tasks = (N/2) * 8
+ * 
+ * Total with adaptive: ~8*(N/2) + 3*(N/2)^2 = 4N + 3N²/4
  */
 int expected_task_count(int num_tiles) {
+    // With adaptive tiles (64-row), iterations are halved
+    int actual_iters = num_tiles / 2;
+    return 14 * actual_iters + 3 * actual_iters * actual_iters;
+}
+
+/**
+ * Calculate expected task count WITHOUT adaptive optimization (for comparison)
+ */
+int expected_task_count_no_adaptive(int num_tiles) {
     return 16 * num_tiles + 3 * num_tiles * num_tiles;
 }
 
@@ -230,33 +256,39 @@ size_t calculate_actual_memory(int task_count, int tensormap_entries) {
 int main(int argc, char** argv) {
     printf("====================================================================\n");
     printf("LLaMA Layer Orchestration Performance Test\n");
+    printf("WITH ADAPTIVE TILE OPTIMIZATION (64-row tiles, scale=2x)\n");
     printf("====================================================================\n");
     printf("\n");
     printf("Configuration:\n");
-    printf("  Tile Size: %d x %d\n", TILE_ROWS, TILE_COLS);
+    printf("  Base Tile Size: %d x %d (32 rows)\n", TILE_ROWS, TILE_COLS);
+    printf("  Adaptive Tile Size: 64 x %d (64 rows, scale=2x)\n", TILE_COLS);
     printf("  Sequence Lengths: 1K to 16K\n");
     printf("\n");
-    printf("Task Graph Complexity:\n");
-    printf("  Phase 1 (Pre-Attn):  6N tasks (parallel)\n");
-    printf("  Phase 2 (Flash Attn): N*(2 + 3N) tasks (cross-tile deps)\n");
-    printf("  Phase 3 (Post-Attn): 8N tasks (parallel)\n");
-    printf("  Total: 16N + 3N^2 tasks\n");
+    printf("Task Graph Complexity WITH ADAPTIVE TILES:\n");
+    printf("  Actual iterations: N/2 (halved due to 64-row tiles)\n");
+    printf("  Phase 1 (Pre-Attn):  6*(N/2) tasks\n");
+    printf("  Phase 2 (Flash Attn): (N/2)^2 * 4 tasks (cross-tile, QUADRATIC REDUCTION!)\n");
+    printf("  Phase 3 (Post-Attn): 8*(N/2) tasks\n");
+    printf("  Total: 14*(N/2) + 3*(N/2)^2 = 7N + 3N^2/4\n");
+    printf("\n");
+    printf("OPTIMIZATION: N^2 -> (N/2)^2 = N^2/4 => 75%% REDUCTION!\n");
     printf("\n");
     printf("====================================================================\n");
-    printf("%-8s %-8s %-10s %-12s %-10s %-12s %-10s\n", 
-           "SeqLen", "Tiles", "Tasks", "Build(ms)", "Tasks/ms", "Memory", "Per-Task");
+    printf("%-8s %-8s %-8s %-10s %-10s %-12s %-10s %-12s %-8s\n", 
+           "SeqLen", "Tiles", "ActIter", "Tasks", "NoAdapt", "Build(ms)", "Tasks/ms", "Memory", "Saved");
     printf("--------------------------------------------------------------------\n");
     
-    // Test sequence lengths from 1K to 8K
-    // For N tiles: tasks = 16N + 3N^2
-    // Task count grows quadratically!
-    int seq_lengths[] = {1024, 2048, 3072, 4096, 5120, 6144, 7168, 8192};
+    // Test sequence lengths from 1K to 16K
+    // With adaptive tiles: iterations are halved, quadratic term becomes N^2/4
+    int seq_lengths[] = {1024, 2048, 4096, 8192, 12288, 16384};
     int num_tests = sizeof(seq_lengths) / sizeof(seq_lengths[0]);
     
     for (int i = 0; i < num_tests; i++) {
         int seq_len = seq_lengths[i];
         int num_tiles = seq_len / TILE_ROWS;
+        int actual_iters = num_tiles / 2;  // With adaptive tiles (64-row)
         int expected_tasks = expected_task_count(num_tiles);
+        int expected_no_adaptive = expected_task_count_no_adaptive(num_tiles);
         
         // Check if we'll exceed the limit
         if (expected_tasks > PTO_MAX_TASKS) {
@@ -264,8 +296,9 @@ int main(int argc, char** argv) {
             double est_mem_mb = (expected_tasks * sizeof(PendingTask) + 
                                 expected_tasks * sizeof(TensorMapEntry) +
                                 sizeof(TensorMapEntry*) * PTO_TENSORMAP_SIZE) / (1024.0 * 1024.0);
-            printf("%-8d %-8d %-10d %-12s %-10s %-10.1f MB (exceeds task limit %d)\n", 
-                   seq_len, num_tiles, expected_tasks, "N/A", "N/A", est_mem_mb, PTO_MAX_TASKS);
+            printf("%-8d %-8d %-8d %-10d %-10d %-12s %-10s %-10.1f MB (exceeds limit %d)\n", 
+                   seq_len, num_tiles, actual_iters, expected_tasks, expected_no_adaptive, 
+                   "N/A", "N/A", est_mem_mb, PTO_MAX_TASKS);
             continue;
         }
         
@@ -292,8 +325,8 @@ int main(int argc, char** argv) {
         // Calculate actual memory used (not the fixed allocation)
         // Count tensormap entries
         int tensormap_entries = 0;
-        for (int i = 0; i < PTO_TENSORMAP_SIZE; i++) {
-            TensorMapEntry* entry = rt->tensor_map[i];
+        for (int j = 0; j < PTO_TENSORMAP_SIZE; j++) {
+            TensorMapEntry* entry = rt->tensor_map[j];
             while (entry) {
                 tensormap_entries++;
                 entry = entry->next;
@@ -304,15 +337,15 @@ int main(int argc, char** argv) {
         size_t actual_mem = actual_tasks * sizeof(PendingTask) + 
                            tensormap_entries * sizeof(TensorMapEntry);
         double actual_mem_mb = actual_mem / (1024.0 * 1024.0);
-        double bytes_per_task = (double)actual_mem / actual_tasks;
+        double savings_pct = 100.0 * (1.0 - (double)actual_tasks / expected_no_adaptive);
         
-        printf("%-8d %-8d %-10d %-12.3f %-10.1f %-10.2f MB %-8.0f B\n", 
-               seq_len, num_tiles, actual_tasks, elapsed_ms, tasks_per_ms,
-               actual_mem_mb, bytes_per_task);
+        printf("%-8d %-8d %-8d %-10d %-10d %-12.3f %-10.1f %-10.2f MB %-6.1f%%\n", 
+               seq_len, num_tiles, actual_iters, actual_tasks, expected_no_adaptive,
+               elapsed_ms, tasks_per_ms, actual_mem_mb, savings_pct);
         
         // Verify task count
         if (actual_tasks != expected_tasks) {
-            printf("  WARNING: Expected %d tasks, got %d\n", expected_tasks, actual_tasks);
+            printf("  WARNING: Expected %d tasks (adaptive), got %d\n", expected_tasks, actual_tasks);
         }
         
         // Cleanup
@@ -322,26 +355,29 @@ int main(int argc, char** argv) {
     
     printf("====================================================================\n");
     printf("\n");
-    printf("Analysis:\n");
+    printf("Analysis - ADAPTIVE TILE OPTIMIZATION:\n");
     printf("--------------------------------------------------------------------\n");
-    printf("  Task count formula: 16N + 3N^2 (where N = seq_len / tile_rows)\n");
-    printf("  - Phase 1 (Pre-Attn):   6N tasks  (all tiles parallel)\n");
-    printf("  - Phase 2 (Flash Attn): N(2+3N)   (Q[i] depends on ALL K[j],V[j])\n");
-    printf("  - Phase 3 (Post-Attn):  8N tasks  (parallel after attention)\n");
+    printf("  WITHOUT ADAPTIVE: 16N + 3N^2 (where N = seq_len / 32-row tiles)\n");
+    printf("  WITH ADAPTIVE:    14*(N/2) + 3*(N/2)^2 = 7N + 3N^2/4\n");
     printf("\n");
-    printf("  O(N^2) growth is due to Flash Attention cross-tile dependencies:\n");
-    printf("    - Each Q tile attends to ALL K,V tiles\n");
-    printf("    - Creates N x N attention score computations\n");
+    printf("  SAVINGS: N^2 -> (N/2)^2 = N^2/4 => 75%% reduction in quadratic term!\n");
     printf("\n");
-    printf("Extrapolation:\n");
-    printf("  %-8s %-8s %-12s %-12s %-12s\n", "SeqLen", "Tiles", "Tasks", "Est. Time", "Est. Memory");
-    for (int s = 8192; s <= 16384; s *= 2) {
+    printf("  The 64-row tiles (vs 32-row) halve iteration count in BOTH loops:\n");
+    printf("    - Outer Q loop: N -> N/2\n");
+    printf("    - Inner KV loop: N -> N/2\n");
+    printf("    - Flash Attention: N*N -> (N/2)*(N/2) = N^2/4\n");
+    printf("\n");
+    printf("Extrapolation (with vs without adaptive):\n");
+    printf("  %-8s %-8s %-12s %-12s %-12s %-8s\n", "SeqLen", "Tiles", "Adaptive", "No-Adaptive", "Savings", "Memory");
+    for (int s = 8192; s <= 32768; s *= 2) {
         int n = s / TILE_ROWS;
-        int tasks = expected_task_count(n);
-        double est_mem_mb = (tasks * sizeof(PendingTask) + 
-                            tasks * sizeof(TensorMapEntry)) / (1024.0 * 1024.0);
-        printf("  %-8d %-8d %-12d ~%-10.1f ms ~%.1f MB\n",
-               s/1024, n, tasks, tasks / 5000.0, est_mem_mb);
+        int tasks_adaptive = expected_task_count(n);
+        int tasks_no_adaptive = expected_task_count_no_adaptive(n);
+        double savings_pct = 100.0 * (1.0 - (double)tasks_adaptive / tasks_no_adaptive);
+        double est_mem_mb = (tasks_adaptive * sizeof(PendingTask) + 
+                            tasks_adaptive * sizeof(TensorMapEntry)) / (1024.0 * 1024.0);
+        printf("  %-8dK %-8d %-12d %-12d %-6.1f%% ~%.1f MB\n",
+               s/1024, n, tasks_adaptive, tasks_no_adaptive, savings_pct, est_mem_mb);
     }
     
     printf("\nData Structure Sizes:\n");
@@ -352,6 +388,9 @@ int main(int argc, char** argv) {
            (sizeof(PendingTask) * PTO_MAX_TASKS + 
             sizeof(TensorMapEntry*) * PTO_TENSORMAP_SIZE +
             sizeof(int32_t) * PTO_MAX_READY_QUEUE) / (1024.0 * 1024.0));
+    printf("\n");
+    printf("CONCLUSION: Adaptive tile optimization provides ~75%% reduction in task count\n");
+    printf("            for Flash Attention's N^2 dependency pattern.\n");
     printf("\n");
     
     return 0;
