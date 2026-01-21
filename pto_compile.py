@@ -29,7 +29,7 @@ from pto_isa_definition import (
     # Base classes
     PTOInstruction, TileInstruction, ScalarInstruction, ControlFlowInstruction,
     
-    # All instructions
+    # All instructions (for dynamic lookup)
     ALL_INSTRUCTIONS, TILE_INSTRUCTIONS, SCALAR_INSTRUCTIONS, CONTROL_FLOW_INSTRUCTIONS,
     
     # Loop constructs
@@ -38,24 +38,24 @@ from pto_isa_definition import (
     # Function call instructions
     CALL, RETURN,
     
-    # Tile instructions
-    TLOAD, TSTORE, TADD, TSUB, TMUL, TDIV, TMATMUL, TMATMUL_ACC,
-    TROWSUM, TCOLSUM, TROWMAX, TRELU, TSQRT, TEXP, TLOG,
-    # Additional unary operations
-    TABS, TNEG, TRSQRT, TRECIP,
-    # Max/Min operations
-    TMAX, TMIN,
-    # Broadcast operations
-    TEXPANDS, TROWEXPAND, TCOLEXPAND,
-    TROWEXPANDSUB, TROWEXPANDDIV, TROWEXPANDMUL,
-    # Tile-scalar operations
-    TADDS, TMULS, TDIVS,
-    # Scalar instructions
+    # Memory operations (manually handled - not auto-generated)
+    TLOAD, TSTORE,
+    
+    # Instructions used by TypeChecker (type hints)
+    TMATMUL,
+    
+    # Scalar instructions (manually handled)
     SADD, SSUB, SMUL, SDIV, SMOV, SLI, SCMP,
     
     # Helper functions
     tile, scalar, index, memref, imm,
+    
+    # Instruction metadata for auto-generating builder methods
+    INSTRUCTION_METADATA,
 )
+
+# Import all tile instruction classes dynamically for auto-generation
+import pto_isa_definition as _pto_isa
 
 
 # =============================================================================
@@ -484,258 +484,27 @@ class PTOFunctionBuilder:
         ))
         return self
     
-    # Tile arithmetic operations
-    def add(self, dst: str, src0: str, src1: str) -> "PTOFunctionBuilder":
-        """Elementwise add of two tiles."""
-        self._add_instr(TADD(
-            dst=self._get_tile(dst),
-            src0=self._get_tile(src0),
-            src1=self._get_tile(src1)
-        ))
-        return self
+    # =========================================================================
+    # Tile Operations - Auto-generated from INSTRUCTION_METADATA
+    # =========================================================================
+    # Most tile operations (add, sub, mul, exp, matmul, etc.) are now
+    # auto-generated at module load time. See _auto_generate_builder_methods().
+    #
+    # To add a new instruction:
+    # 1. Define the instruction class in pto_isa_definition.py
+    # 2. Add an entry to INSTRUCTION_METADATA with builder_name and pattern
+    # 3. The method will be auto-generated on next module load
+    #
+    # To override an auto-generated method, define it manually here.
+    # Manual definitions take precedence over auto-generated ones.
+    # =========================================================================
     
-    def sub(self, dst: str, src0: str, src1: str) -> "PTOFunctionBuilder":
-        """Elementwise subtract of two tiles."""
-        self._add_instr(TSUB(
-            dst=self._get_tile(dst),
-            src0=self._get_tile(src0),
-            src1=self._get_tile(src1)
-        ))
-        return self
-    
-    def mul(self, dst: str, src0: str, src1: str) -> "PTOFunctionBuilder":
-        """Elementwise multiply of two tiles."""
-        self._add_instr(TMUL(
-            dst=self._get_tile(dst),
-            src0=self._get_tile(src0),
-            src1=self._get_tile(src1)
-        ))
-        return self
-    
-    def div(self, dst: str, src0: str, src1: str) -> "PTOFunctionBuilder":
-        """Elementwise divide of two tiles."""
-        self._add_instr(TDIV(
-            dst=self._get_tile(dst),
-            src0=self._get_tile(src0),
-            src1=self._get_tile(src1)
-        ))
-        return self
-    
-    # Scalar operations (tile op scalar)
+    # Helper method for scalar operands (used by auto-generated scalar ops)
     def _make_scalar_operand(self, value: float) -> ScalarOperand:
         """Create a scalar operand for an immediate value."""
         # Create a unique name for the immediate value
         name = f"_imm_{abs(hash(value)) % 10000}"
         return ScalarOperand(name=str(value), element_type=ElementType.F32)
-    
-    def adds(self, dst: str, src: str, scalar: float) -> "PTOFunctionBuilder":
-        """Add scalar to all elements of tile."""
-        self._add_instr(TADDS(
-            dst=self._get_tile(dst),
-            src=self._get_tile(src),
-            scalar=self._make_scalar_operand(scalar)
-        ))
-        return self
-    
-    def muls(self, dst: str, src: str, scalar: float) -> "PTOFunctionBuilder":
-        """Multiply all elements of tile by scalar."""
-        self._add_instr(TMULS(
-            dst=self._get_tile(dst),
-            src=self._get_tile(src),
-            scalar=self._make_scalar_operand(scalar)
-        ))
-        return self
-    
-    def divs(self, dst: str, src: str, scalar: float) -> "PTOFunctionBuilder":
-        """Divide all elements of tile by scalar."""
-        self._add_instr(TDIVS(
-            dst=self._get_tile(dst),
-            src=self._get_tile(src),
-            scalar=self._make_scalar_operand(scalar)
-        ))
-        return self
-    
-    # Matrix operations
-    def matmul(self, dst: str, a: str, b: str) -> "PTOFunctionBuilder":
-        """Matrix multiply."""
-        self._add_instr(TMATMUL(
-            dst=self._get_tile(dst),
-            a=self._get_tile(a),
-            b=self._get_tile(b)
-        ))
-        return self
-    
-    def matmul_acc(self, dst: str, acc: str, a: str, b: str) -> "PTOFunctionBuilder":
-        """Matrix multiply with accumulator."""
-        self._add_instr(TMATMUL_ACC(
-            dst=self._get_tile(dst),
-            acc=self._get_tile(acc),
-            a=self._get_tile(a),
-            b=self._get_tile(b)
-        ))
-        return self
-    
-    # Activation functions
-    def relu(self, dst: str, src: str) -> "PTOFunctionBuilder":
-        """Apply ReLU activation."""
-        self._add_instr(TRELU(
-            dst=self._get_tile(dst),
-            src=self._get_tile(src)
-        ))
-        return self
-    
-    def exp(self, dst: str, src: str) -> "PTOFunctionBuilder":
-        """Apply exponential."""
-        self._add_instr(TEXP(
-            dst=self._get_tile(dst),
-            src=self._get_tile(src)
-        ))
-        return self
-    
-    def log(self, dst: str, src: str) -> "PTOFunctionBuilder":
-        """Apply natural logarithm."""
-        self._add_instr(TLOG(
-            dst=self._get_tile(dst),
-            src=self._get_tile(src)
-        ))
-        return self
-    
-    def sqrt(self, dst: str, src: str) -> "PTOFunctionBuilder":
-        """Apply square root."""
-        self._add_instr(TSQRT(
-            dst=self._get_tile(dst),
-            src=self._get_tile(src)
-        ))
-        return self
-    
-    def abs(self, dst: str, src: str) -> "PTOFunctionBuilder":
-        """Apply absolute value."""
-        self._add_instr(TABS(
-            dst=self._get_tile(dst),
-            src=self._get_tile(src)
-        ))
-        return self
-    
-    def neg(self, dst: str, src: str) -> "PTOFunctionBuilder":
-        """Apply negation."""
-        self._add_instr(TNEG(
-            dst=self._get_tile(dst),
-            src=self._get_tile(src)
-        ))
-        return self
-    
-    def rsqrt(self, dst: str, src: str) -> "PTOFunctionBuilder":
-        """Apply reciprocal square root (1/sqrt(x))."""
-        self._add_instr(TRSQRT(
-            dst=self._get_tile(dst),
-            src=self._get_tile(src)
-        ))
-        return self
-    
-    def recip(self, dst: str, src: str) -> "PTOFunctionBuilder":
-        """Apply reciprocal (1/x)."""
-        self._add_instr(TRECIP(
-            dst=self._get_tile(dst),
-            src=self._get_tile(src)
-        ))
-        return self
-    
-    # Binary max/min operations
-    def max(self, dst: str, src0: str, src1: str) -> "PTOFunctionBuilder":
-        """Elementwise maximum of two tiles."""
-        self._add_instr(TMAX(
-            dst=self._get_tile(dst),
-            src0=self._get_tile(src0),
-            src1=self._get_tile(src1)
-        ))
-        return self
-    
-    def min(self, dst: str, src0: str, src1: str) -> "PTOFunctionBuilder":
-        """Elementwise minimum of two tiles."""
-        self._add_instr(TMIN(
-            dst=self._get_tile(dst),
-            src0=self._get_tile(src0),
-            src1=self._get_tile(src1)
-        ))
-        return self
-    
-    # Broadcast operations
-    def expands(self, dst: str, value: float) -> "PTOFunctionBuilder":
-        """Broadcast a scalar value to all elements of a tile."""
-        self._add_instr(TEXPANDS(
-            dst=self._get_tile(dst),
-            scalar=self._make_scalar_operand(value)
-        ))
-        return self
-    
-    def rowexpand(self, dst: str, src: str) -> "PTOFunctionBuilder":
-        """Broadcast first element of each row across the row."""
-        self._add_instr(TROWEXPAND(
-            dst=self._get_tile(dst),
-            src=self._get_tile(src)
-        ))
-        return self
-    
-    def colexpand(self, dst: str, src: str) -> "PTOFunctionBuilder":
-        """Broadcast first element of each column across the column."""
-        self._add_instr(TCOLEXPAND(
-            dst=self._get_tile(dst),
-            src=self._get_tile(src)
-        ))
-        return self
-    
-    # Row-wise broadcast operations (src1 is [N,1], broadcast to [N,M])
-    def rowexpandsub(self, dst: str, src0: str, src1: str) -> "PTOFunctionBuilder":
-        """Row-wise broadcast subtract: dst = src0 - broadcast(src1)."""
-        self._add_instr(TROWEXPANDSUB(
-            dst=self._get_tile(dst),
-            src0=self._get_tile(src0),
-            src1=self._get_tile(src1)
-        ))
-        return self
-    
-    def rowexpanddiv(self, dst: str, src0: str, src1: str) -> "PTOFunctionBuilder":
-        """Row-wise broadcast divide: dst = src0 / broadcast(src1)."""
-        self._add_instr(TROWEXPANDDIV(
-            dst=self._get_tile(dst),
-            src0=self._get_tile(src0),
-            src1=self._get_tile(src1)
-        ))
-        return self
-    
-    def rowexpandmul(self, dst: str, src0: str, src1: str) -> "PTOFunctionBuilder":
-        """Row-wise broadcast multiply: dst = src0 * broadcast(src1)."""
-        self._add_instr(TROWEXPANDMUL(
-            dst=self._get_tile(dst),
-            src0=self._get_tile(src0),
-            src1=self._get_tile(src1)
-        ))
-        return self
-    
-    # Reduction operations
-    def rowsum(self, dst: str, src: str) -> "PTOFunctionBuilder":
-        """Sum reduction across rows."""
-        self._add_instr(TROWSUM(
-            dst=self._get_tile(dst),
-            src=self._get_tile(src)
-        ))
-        return self
-    
-    def rowmax(self, dst: str, src: str) -> "PTOFunctionBuilder":
-        """Max reduction across rows: dst[i,0] = max(src[i,:])"""
-        self._add_instr(TROWMAX(
-            dst=self._get_tile(dst),
-            src=self._get_tile(src)
-        ))
-        return self
-    
-    def colsum(self, dst: str, src: str) -> "PTOFunctionBuilder":
-        """Sum reduction across columns."""
-        self._add_instr(TCOLSUM(
-            dst=self._get_tile(dst),
-            src=self._get_tile(src)
-        ))
-        return self
     
     # Loop constructs
     def for_loop(self, iv_name: str, 
@@ -1134,6 +903,184 @@ class PTOFunctionBuilder:
         if self._loop_stack:
             raise ValidationError("Unclosed loop constructs")
         return self.program
+
+
+# =============================================================================
+# Auto-generate PTOFunctionBuilder methods from INSTRUCTION_METADATA
+# =============================================================================
+# This section dynamically adds methods to PTOFunctionBuilder based on the
+# instruction metadata defined in pto_isa_definition.py.
+#
+# Each pattern defines a different method signature and implementation:
+# - binary: (dst, src0, src1) -> elementwise binary op
+# - unary: (dst, src) -> elementwise unary op
+# - scalar: (dst, src, scalar) -> tile-scalar op
+# - reduce_row/reduce_col: (dst, src) -> reduction op
+# - broadcast_row: (dst, src0, src1) -> row broadcast binary op
+# - matmul: (dst, a, b) -> matrix multiply
+# - matmul_acc: (dst, acc, a, b) -> matrix multiply with accumulator
+# - expand_scalar: (dst, scalar) -> broadcast scalar
+# - expand_tile: (dst, src) -> broadcast tile element
+
+def _auto_generate_builder_methods():
+    """
+    Automatically generate PTOFunctionBuilder methods from INSTRUCTION_METADATA.
+    
+    This function is called once at module load time to populate the
+    PTOFunctionBuilder class with methods for each instruction.
+    """
+    
+    def _make_binary_method(instr_class, doc):
+        """Create a binary operation method: (dst, src0, src1)"""
+        def method(self, dst: str, src0: str, src1: str) -> "PTOFunctionBuilder":
+            self._add_instr(instr_class(
+                dst=self._get_tile(dst),
+                src0=self._get_tile(src0),
+                src1=self._get_tile(src1)
+            ))
+            return self
+        method.__doc__ = doc
+        return method
+    
+    def _make_unary_method(instr_class, doc):
+        """Create a unary operation method: (dst, src)"""
+        def method(self, dst: str, src: str) -> "PTOFunctionBuilder":
+            self._add_instr(instr_class(
+                dst=self._get_tile(dst),
+                src=self._get_tile(src)
+            ))
+            return self
+        method.__doc__ = doc
+        return method
+    
+    def _make_scalar_method(instr_class, doc):
+        """Create a tile-scalar operation method: (dst, src, scalar)"""
+        def method(self, dst: str, src: str, scalar_val: float) -> "PTOFunctionBuilder":
+            self._add_instr(instr_class(
+                dst=self._get_tile(dst),
+                src=self._get_tile(src),
+                scalar=self._make_scalar_operand(scalar_val)
+            ))
+            return self
+        method.__doc__ = doc
+        return method
+    
+    def _make_reduce_method(instr_class, doc):
+        """Create a reduction operation method: (dst, src)"""
+        def method(self, dst: str, src: str) -> "PTOFunctionBuilder":
+            self._add_instr(instr_class(
+                dst=self._get_tile(dst),
+                src=self._get_tile(src)
+            ))
+            return self
+        method.__doc__ = doc
+        return method
+    
+    def _make_broadcast_row_method(instr_class, doc):
+        """Create a row-broadcast binary operation method: (dst, src0, src1)"""
+        def method(self, dst: str, src0: str, src1: str) -> "PTOFunctionBuilder":
+            self._add_instr(instr_class(
+                dst=self._get_tile(dst),
+                src0=self._get_tile(src0),
+                src1=self._get_tile(src1)
+            ))
+            return self
+        method.__doc__ = doc
+        return method
+    
+    def _make_matmul_method(instr_class, doc):
+        """Create a matrix multiply method: (dst, a, b)"""
+        def method(self, dst: str, a: str, b: str) -> "PTOFunctionBuilder":
+            self._add_instr(instr_class(
+                dst=self._get_tile(dst),
+                a=self._get_tile(a),
+                b=self._get_tile(b)
+            ))
+            return self
+        method.__doc__ = doc
+        return method
+    
+    def _make_matmul_acc_method(instr_class, doc):
+        """Create a matrix multiply with accumulator method: (dst, acc, a, b)"""
+        def method(self, dst: str, acc: str, a: str, b: str) -> "PTOFunctionBuilder":
+            self._add_instr(instr_class(
+                dst=self._get_tile(dst),
+                acc=self._get_tile(acc),
+                a=self._get_tile(a),
+                b=self._get_tile(b)
+            ))
+            return self
+        method.__doc__ = doc
+        return method
+    
+    def _make_expand_scalar_method(instr_class, doc):
+        """Create a broadcast scalar method: (dst, scalar)"""
+        def method(self, dst: str, scalar_val: float) -> "PTOFunctionBuilder":
+            self._add_instr(instr_class(
+                dst=self._get_tile(dst),
+                scalar=self._make_scalar_operand(scalar_val)
+            ))
+            return self
+        method.__doc__ = doc
+        return method
+    
+    def _make_expand_tile_method(instr_class, doc):
+        """Create a broadcast tile method: (dst, src)"""
+        def method(self, dst: str, src: str) -> "PTOFunctionBuilder":
+            self._add_instr(instr_class(
+                dst=self._get_tile(dst),
+                src=self._get_tile(src)
+            ))
+            return self
+        method.__doc__ = doc
+        return method
+    
+    # Pattern to method factory mapping
+    pattern_factories = {
+        "binary": _make_binary_method,
+        "unary": _make_unary_method,
+        "scalar": _make_scalar_method,
+        "reduce_row": _make_reduce_method,
+        "reduce_col": _make_reduce_method,
+        "broadcast_row": _make_broadcast_row_method,
+        "matmul": _make_matmul_method,
+        "matmul_acc": _make_matmul_acc_method,
+        "expand_scalar": _make_expand_scalar_method,
+        "expand_tile": _make_expand_tile_method,
+    }
+    
+    # Generate methods for each instruction in metadata
+    generated_count = 0
+    for instr_name, meta in INSTRUCTION_METADATA.items():
+        builder_name = meta["builder_name"]
+        pattern = meta["pattern"]
+        doc = meta.get("doc", f"Auto-generated method for {instr_name}")
+        
+        # Skip if method already exists (allow manual override)
+        if hasattr(PTOFunctionBuilder, builder_name):
+            continue
+        
+        # Get the instruction class
+        instr_class = getattr(_pto_isa, instr_name, None)
+        if instr_class is None:
+            print(f"Warning: Instruction class '{instr_name}' not found in pto_isa_definition")
+            continue
+        
+        # Get the factory for this pattern
+        factory = pattern_factories.get(pattern)
+        if factory is None:
+            print(f"Warning: Unknown pattern '{pattern}' for instruction '{instr_name}'")
+            continue
+        
+        # Create and attach the method
+        method = factory(instr_class, doc)
+        setattr(PTOFunctionBuilder, builder_name, method)
+        generated_count += 1
+    
+    return generated_count
+
+# Execute auto-generation at module load time
+_AUTO_GENERATED_METHOD_COUNT = _auto_generate_builder_methods()
 
 
 # =============================================================================

@@ -3834,6 +3834,288 @@ def imm(value: Union[int, float]) -> ImmediateOperand:
 
 
 # =============================================================================
+# Instruction Metadata for Auto-generating PTOFunctionBuilder Methods
+# =============================================================================
+# 
+# This metadata drives automatic generation of builder methods in pto_compile.py.
+# Each entry defines:
+#   - builder_name: Method name exposed in PTOFunctionBuilder (e.g., "add" -> .add())
+#   - pattern: Operand pattern for automatic method signature generation
+#   - doc: Documentation string for the generated method
+#
+# Supported patterns:
+#   - "binary":       (dst, src0, src1) -> Elementwise binary ops (add, sub, mul, etc.)
+#   - "unary":        (dst, src) -> Elementwise unary ops (exp, log, sqrt, etc.)
+#   - "scalar":       (dst, src, scalar) -> Tile-scalar ops (adds, muls, etc.)
+#   - "reduce_row":   (dst, src) -> Row reduction ops (rowsum, rowmax, etc.)
+#   - "reduce_col":   (dst, src) -> Column reduction ops (colsum, colmax, etc.)
+#   - "broadcast_row": (dst, src0, src1) -> Row broadcast binary ops
+#   - "matmul":       (dst, a, b) -> Matrix multiply
+#   - "expand_scalar": (dst, scalar) -> Broadcast scalar to tile
+#   - "expand_tile":  (dst, src) -> Broadcast tile elements
+#
+# Instructions NOT in this dict require manual builder methods (e.g., load, store, for_loop)
+
+INSTRUCTION_METADATA: Dict[str, Dict[str, Any]] = {
+    # =========================================================================
+    # Elementwise Binary Operations (pattern: binary)
+    # =========================================================================
+    "TADD": {
+        "builder_name": "add",
+        "pattern": "binary",
+        "doc": "Elementwise add of two tiles: dst = src0 + src1"
+    },
+    "TSUB": {
+        "builder_name": "sub",
+        "pattern": "binary",
+        "doc": "Elementwise subtract of two tiles: dst = src0 - src1"
+    },
+    "TMUL": {
+        "builder_name": "mul",
+        "pattern": "binary",
+        "doc": "Elementwise multiply of two tiles: dst = src0 * src1"
+    },
+    "TDIV": {
+        "builder_name": "div",
+        "pattern": "binary",
+        "doc": "Elementwise divide of two tiles: dst = src0 / src1"
+    },
+    "TREM": {
+        "builder_name": "rem",
+        "pattern": "binary",
+        "doc": "Elementwise remainder of two tiles: dst = src0 % src1"
+    },
+    "TMAX": {
+        "builder_name": "max",
+        "pattern": "binary",
+        "doc": "Elementwise maximum of two tiles: dst = max(src0, src1)"
+    },
+    "TMIN": {
+        "builder_name": "min",
+        "pattern": "binary",
+        "doc": "Elementwise minimum of two tiles: dst = min(src0, src1)"
+    },
+    "TAND": {
+        "builder_name": "bitwise_and",
+        "pattern": "binary",
+        "doc": "Elementwise bitwise AND of two tiles"
+    },
+    "TOR": {
+        "builder_name": "bitwise_or",
+        "pattern": "binary",
+        "doc": "Elementwise bitwise OR of two tiles"
+    },
+    "TXOR": {
+        "builder_name": "bitwise_xor",
+        "pattern": "binary",
+        "doc": "Elementwise bitwise XOR of two tiles"
+    },
+    "TSHL": {
+        "builder_name": "shl",
+        "pattern": "binary",
+        "doc": "Elementwise left shift: dst = src0 << src1"
+    },
+    "TSHR": {
+        "builder_name": "shr",
+        "pattern": "binary",
+        "doc": "Elementwise right shift: dst = src0 >> src1"
+    },
+    
+    # =========================================================================
+    # Elementwise Unary Operations (pattern: unary)
+    # =========================================================================
+    "TABS": {
+        "builder_name": "abs",
+        "pattern": "unary",
+        "doc": "Elementwise absolute value: dst = |src|"
+    },
+    "TNEG": {
+        "builder_name": "neg",
+        "pattern": "unary",
+        "doc": "Elementwise negation: dst = -src"
+    },
+    "TNOT": {
+        "builder_name": "bitwise_not",
+        "pattern": "unary",
+        "doc": "Elementwise bitwise NOT: dst = ~src"
+    },
+    "TEXP": {
+        "builder_name": "exp",
+        "pattern": "unary",
+        "doc": "Elementwise exponential: dst = exp(src)"
+    },
+    "TLOG": {
+        "builder_name": "log",
+        "pattern": "unary",
+        "doc": "Elementwise natural logarithm: dst = log(src)"
+    },
+    "TSQRT": {
+        "builder_name": "sqrt",
+        "pattern": "unary",
+        "doc": "Elementwise square root: dst = sqrt(src)"
+    },
+    "TRSQRT": {
+        "builder_name": "rsqrt",
+        "pattern": "unary",
+        "doc": "Elementwise reciprocal square root: dst = 1/sqrt(src)"
+    },
+    "TRECIP": {
+        "builder_name": "recip",
+        "pattern": "unary",
+        "doc": "Elementwise reciprocal: dst = 1/src"
+    },
+    "TRELU": {
+        "builder_name": "relu",
+        "pattern": "unary",
+        "doc": "Elementwise ReLU activation: dst = max(0, src)"
+    },
+    
+    # =========================================================================
+    # Tile-Scalar Operations (pattern: scalar)
+    # =========================================================================
+    "TADDS": {
+        "builder_name": "adds",
+        "pattern": "scalar",
+        "doc": "Add scalar to all elements: dst = src + scalar"
+    },
+    "TSUBS": {
+        "builder_name": "subs",
+        "pattern": "scalar",
+        "doc": "Subtract scalar from all elements: dst = src - scalar"
+    },
+    "TMULS": {
+        "builder_name": "muls",
+        "pattern": "scalar",
+        "doc": "Multiply all elements by scalar: dst = src * scalar"
+    },
+    "TDIVS": {
+        "builder_name": "divs",
+        "pattern": "scalar",
+        "doc": "Divide all elements by scalar: dst = src / scalar"
+    },
+    "TREMS": {
+        "builder_name": "rems",
+        "pattern": "scalar",
+        "doc": "Remainder of all elements by scalar: dst = src % scalar"
+    },
+    "TMAXS": {
+        "builder_name": "maxs",
+        "pattern": "scalar",
+        "doc": "Maximum of elements with scalar: dst = max(src, scalar)"
+    },
+    "TMINS": {
+        "builder_name": "mins",
+        "pattern": "scalar",
+        "doc": "Minimum of elements with scalar: dst = min(src, scalar)"
+    },
+    
+    # =========================================================================
+    # Row Reduction Operations (pattern: reduce_row)
+    # =========================================================================
+    "TROWSUM": {
+        "builder_name": "rowsum",
+        "pattern": "reduce_row",
+        "doc": "Row-wise sum reduction: dst[i,0] = sum(src[i,:])"
+    },
+    "TROWMAX": {
+        "builder_name": "rowmax",
+        "pattern": "reduce_row",
+        "doc": "Row-wise max reduction: dst[i,0] = max(src[i,:])"
+    },
+    "TROWMIN": {
+        "builder_name": "rowmin",
+        "pattern": "reduce_row",
+        "doc": "Row-wise min reduction: dst[i,0] = min(src[i,:])"
+    },
+    
+    # =========================================================================
+    # Column Reduction Operations (pattern: reduce_col)
+    # =========================================================================
+    "TCOLSUM": {
+        "builder_name": "colsum",
+        "pattern": "reduce_col",
+        "doc": "Column-wise sum reduction: dst[0,j] = sum(src[:,j])"
+    },
+    "TCOLMAX": {
+        "builder_name": "colmax",
+        "pattern": "reduce_col",
+        "doc": "Column-wise max reduction: dst[0,j] = max(src[:,j])"
+    },
+    "TCOLMIN": {
+        "builder_name": "colmin",
+        "pattern": "reduce_col",
+        "doc": "Column-wise min reduction: dst[0,j] = min(src[:,j])"
+    },
+    
+    # =========================================================================
+    # Row Broadcast Operations (pattern: broadcast_row)
+    # =========================================================================
+    "TROWEXPANDSUB": {
+        "builder_name": "rowexpandsub",
+        "pattern": "broadcast_row",
+        "doc": "Row-wise broadcast subtract: dst = src0 - broadcast(src1)"
+    },
+    "TROWEXPANDDIV": {
+        "builder_name": "rowexpanddiv",
+        "pattern": "broadcast_row",
+        "doc": "Row-wise broadcast divide: dst = src0 / broadcast(src1)"
+    },
+    "TROWEXPANDMUL": {
+        "builder_name": "rowexpandmul",
+        "pattern": "broadcast_row",
+        "doc": "Row-wise broadcast multiply: dst = src0 * broadcast(src1)"
+    },
+    
+    # =========================================================================
+    # Matrix Operations (pattern: matmul)
+    # =========================================================================
+    "TMATMUL": {
+        "builder_name": "matmul",
+        "pattern": "matmul",
+        "doc": "Matrix multiplication: dst = a @ b"
+    },
+    "TMATMUL_ACC": {
+        "builder_name": "matmul_acc",
+        "pattern": "matmul_acc",
+        "doc": "Matrix multiply with accumulator: dst = acc + a @ b"
+    },
+    
+    # =========================================================================
+    # Broadcast Operations (pattern: expand_scalar, expand_tile)
+    # =========================================================================
+    "TEXPANDS": {
+        "builder_name": "expands",
+        "pattern": "expand_scalar",
+        "doc": "Broadcast scalar to all elements: dst[i,j] = scalar"
+    },
+    "TROWEXPAND": {
+        "builder_name": "rowexpand",
+        "pattern": "expand_tile",
+        "doc": "Broadcast first column across rows: dst[i,j] = src[i,0]"
+    },
+    "TCOLEXPAND": {
+        "builder_name": "colexpand",
+        "pattern": "expand_tile",
+        "doc": "Broadcast first row across columns: dst[i,j] = src[0,j]"
+    },
+    
+    # =========================================================================
+    # Data Movement Operations
+    # =========================================================================
+    "TTRANS": {
+        "builder_name": "transpose",
+        "pattern": "unary",
+        "doc": "Transpose tile: dst = src.T"
+    },
+    "TMOV": {
+        "builder_name": "mov",
+        "pattern": "unary",
+        "doc": "Copy tile: dst = src"
+    },
+}
+
+
+# =============================================================================
 # Example Usage
 # =============================================================================
 
