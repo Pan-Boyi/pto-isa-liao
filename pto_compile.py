@@ -3322,9 +3322,17 @@ def _gen_task_scheduling_code(callee: str, args: Union[List, Dict], orch_ctx: Or
         t_rows = rows
         t_cols = cols
         
-        # Adjust for reduction outputs
+        # Adjust for reduction outputs (rowmax/rowsum output is [rows, 1])
         if callee in ['rowmax', 'rowsum', 'tile_rowmax', 'tile_rowsum'] and is_output:
             t_cols = 1
+        
+        # Adjust for rowexpand series functions - input_row parameter is [rows, 1]
+        # These functions take a row vector (from rowmax/rowsum output) as second input
+        if callee in ['rowexpandsub', 'rowexpanddiv', 'rowexpandmul', 
+                      'tile_rowexpandsub', 'tile_rowexpanddiv', 'tile_rowexpandmul']:
+            # Check if this is the row vector input (not the main matrix input)
+            if not is_output and 'row' in param_name.lower():
+                t_cols = 1
         
         # Parse argument value: can be string or tuple
         if isinstance(arg_value, tuple):
@@ -5032,13 +5040,21 @@ class OrchestrationCodeGenerator:
     
     def _infer_shape(self, param_name: str, callee_name: str, is_output: bool) -> Tuple[int, int]:
         """Infer tensor shape from parameter name, callee function, and position."""
-        if callee_name in ['rowmax', 'rowsum'] and is_output:
+        # Reduction outputs (rowmax/rowsum) produce [rows, 1] tensors
+        if callee_name in ['rowmax', 'rowsum', 'tile_rowmax', 'tile_rowsum'] and is_output:
             return (8, 1)
-        if callee_name in ['rowexpandsub', 'rowexpanddiv', 'rowexpandmul']:
-            if 'row' in param_name.lower() and 'input' in param_name.lower():
+        
+        # Rowexpand functions take a row vector as the second input
+        # The parameter name usually contains 'row' (e.g., input_row)
+        if callee_name in ['rowexpandsub', 'rowexpanddiv', 'rowexpandmul',
+                           'tile_rowexpandsub', 'tile_rowexpanddiv', 'tile_rowexpandmul']:
+            if not is_output and 'row' in param_name.lower():
                 return (8, 1)
-        if any(kw in param_name.lower() for kw in ['rowmax', 'rowsum', 'row_max', 'row_sum']):
+        
+        # Also check if the tensor name itself indicates a row vector
+        if any(kw in param_name.lower() for kw in ['rowmax', 'rowsum', 'row_max', 'row_sum', 'temp_rowmax', 'temp_rowsum']):
             return (8, 1)
+        
         return (8, 8)
     
     def compile_and_run(self, entry_func: str, output_dir: str) -> Optional[str]:

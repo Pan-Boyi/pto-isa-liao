@@ -8,7 +8,7 @@ SUMMARY
   Total tasks completed:  0
   Active task count:      40
   Next task ID:           40
-  Ready queue size:       16
+  Ready queue size:       8
 
 ================================================================================
 TASK TABLE (pend_task)
@@ -34,22 +34,24 @@ TASK 0
 
   FANOUT LIST (consumers that depend on this task)
   ------------------------------------------------
-    fanout_count = 0
-    fanout[] = [] (no consumers)
+    fanout_count = 1
+    fanout[] = [1]
+    Consumers:
+      -> Task 1 (rowexpandsub)
 
   ARGUMENTS (num_args = 2)
   -------------------------
     [0] INPUT:
-        tensor:     0x16efa1ed8
+        tensor:     0x16da65f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
     [1] OUTPUT:
-        tensor:     0x16ef9fed8
+        tensor:     0x16da63f38
         row_offset: 0
         col_offset: 0
-        rows:       8
+        rows:       32
         cols:       1
 
 --------------------------------------------------------------------------------
@@ -68,7 +70,7 @@ TASK 1
 
   FANIN COUNTER
   -------------
-    fanin = 0
+    fanin = 1
 
   FANOUT LIST (consumers that depend on this task)
   ------------------------------------------------
@@ -80,23 +82,23 @@ TASK 1
   ARGUMENTS (num_args = 3)
   -------------------------
     [0] INPUT:
-        tensor:     0x16efa1ed8
+        tensor:     0x16da65f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
     [1] INPUT:
-        tensor:     0x16ef9fed8
+        tensor:     0x16da63f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       1
     [2] OUTPUT:
-        tensor:     0x16ef9eed8
+        tensor:     0x16da62f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
 
 --------------------------------------------------------------------------------
 TASK 2
@@ -127,17 +129,17 @@ TASK 2
   ARGUMENTS (num_args = 2)
   -------------------------
     [0] INPUT:
-        tensor:     0x16ef9eed8
+        tensor:     0x16da62f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
     [1] OUTPUT:
-        tensor:     0x16ef9ded8
+        tensor:     0x16da61f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
 
 --------------------------------------------------------------------------------
 TASK 3
@@ -159,22 +161,24 @@ TASK 3
 
   FANOUT LIST (consumers that depend on this task)
   ------------------------------------------------
-    fanout_count = 0
-    fanout[] = [] (no consumers)
+    fanout_count = 1
+    fanout[] = [4]
+    Consumers:
+      -> Task 4 (rowexpanddiv)
 
   ARGUMENTS (num_args = 2)
   -------------------------
     [0] INPUT:
-        tensor:     0x16ef9ded8
+        tensor:     0x16da61f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
     [1] OUTPUT:
-        tensor:     0x16ef9ced8
+        tensor:     0x16da60f38
         row_offset: 0
         col_offset: 0
-        rows:       8
+        rows:       32
         cols:       1
 
 --------------------------------------------------------------------------------
@@ -193,7 +197,7 @@ TASK 4
 
   FANIN COUNTER
   -------------
-    fanin = 1
+    fanin = 2
 
   FANOUT LIST (consumers that depend on this task)
   ------------------------------------------------
@@ -203,23 +207,23 @@ TASK 4
   ARGUMENTS (num_args = 3)
   -------------------------
     [0] INPUT:
-        tensor:     0x16ef9ded8
+        tensor:     0x16da61f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
     [1] INPUT:
-        tensor:     0x16ef9ced8
+        tensor:     0x16da60f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       1
     [2] OUTPUT:
-        tensor:     0x16efa0ed8
+        tensor:     0x16da64f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
 
 --------------------------------------------------------------------------------
 TASK 5
@@ -241,22 +245,24 @@ TASK 5
 
   FANOUT LIST (consumers that depend on this task)
   ------------------------------------------------
-    fanout_count = 0
-    fanout[] = [] (no consumers)
+    fanout_count = 1
+    fanout[] = [6]
+    Consumers:
+      -> Task 6 (rowexpandsub)
 
   ARGUMENTS (num_args = 2)
   -------------------------
     [0] INPUT:
-        tensor:     0x16efa1ed8
+        tensor:     0x16da65f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
     [1] OUTPUT:
-        tensor:     0x16ef9fed8
+        tensor:     0x16da63f38
         row_offset: 0
         col_offset: 0
-        rows:       8
+        rows:       32
         cols:       1
 
 --------------------------------------------------------------------------------
@@ -275,7 +281,7 @@ TASK 6
 
   FANIN COUNTER
   -------------
-    fanin = 0
+    fanin = 1
 
   FANOUT LIST (consumers that depend on this task)
   ------------------------------------------------
@@ -287,23 +293,23 @@ TASK 6
   ARGUMENTS (num_args = 3)
   -------------------------
     [0] INPUT:
-        tensor:     0x16efa1ed8
+        tensor:     0x16da65f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
     [1] INPUT:
-        tensor:     0x16ef9fed8
+        tensor:     0x16da63f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       1
     [2] OUTPUT:
-        tensor:     0x16ef9eed8
+        tensor:     0x16da62f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
 
 --------------------------------------------------------------------------------
 TASK 7
@@ -334,17 +340,17 @@ TASK 7
   ARGUMENTS (num_args = 2)
   -------------------------
     [0] INPUT:
-        tensor:     0x16ef9eed8
+        tensor:     0x16da62f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
     [1] OUTPUT:
-        tensor:     0x16ef9ded8
+        tensor:     0x16da61f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
 
 --------------------------------------------------------------------------------
 TASK 8
@@ -366,22 +372,24 @@ TASK 8
 
   FANOUT LIST (consumers that depend on this task)
   ------------------------------------------------
-    fanout_count = 0
-    fanout[] = [] (no consumers)
+    fanout_count = 1
+    fanout[] = [9]
+    Consumers:
+      -> Task 9 (rowexpanddiv)
 
   ARGUMENTS (num_args = 2)
   -------------------------
     [0] INPUT:
-        tensor:     0x16ef9ded8
+        tensor:     0x16da61f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
     [1] OUTPUT:
-        tensor:     0x16ef9ced8
+        tensor:     0x16da60f38
         row_offset: 0
         col_offset: 0
-        rows:       8
+        rows:       32
         cols:       1
 
 --------------------------------------------------------------------------------
@@ -400,7 +408,7 @@ TASK 9
 
   FANIN COUNTER
   -------------
-    fanin = 1
+    fanin = 2
 
   FANOUT LIST (consumers that depend on this task)
   ------------------------------------------------
@@ -410,23 +418,23 @@ TASK 9
   ARGUMENTS (num_args = 3)
   -------------------------
     [0] INPUT:
-        tensor:     0x16ef9ded8
+        tensor:     0x16da61f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
     [1] INPUT:
-        tensor:     0x16ef9ced8
+        tensor:     0x16da60f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       1
     [2] OUTPUT:
-        tensor:     0x16efa0ed8
+        tensor:     0x16da64f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
 
 --------------------------------------------------------------------------------
 TASK 10
@@ -448,22 +456,24 @@ TASK 10
 
   FANOUT LIST (consumers that depend on this task)
   ------------------------------------------------
-    fanout_count = 0
-    fanout[] = [] (no consumers)
+    fanout_count = 1
+    fanout[] = [11]
+    Consumers:
+      -> Task 11 (rowexpandsub)
 
   ARGUMENTS (num_args = 2)
   -------------------------
     [0] INPUT:
-        tensor:     0x16efa1ed8
+        tensor:     0x16da65f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
     [1] OUTPUT:
-        tensor:     0x16ef9fed8
+        tensor:     0x16da63f38
         row_offset: 0
         col_offset: 0
-        rows:       8
+        rows:       32
         cols:       1
 
 --------------------------------------------------------------------------------
@@ -482,7 +492,7 @@ TASK 11
 
   FANIN COUNTER
   -------------
-    fanin = 0
+    fanin = 1
 
   FANOUT LIST (consumers that depend on this task)
   ------------------------------------------------
@@ -494,23 +504,23 @@ TASK 11
   ARGUMENTS (num_args = 3)
   -------------------------
     [0] INPUT:
-        tensor:     0x16efa1ed8
+        tensor:     0x16da65f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
     [1] INPUT:
-        tensor:     0x16ef9fed8
+        tensor:     0x16da63f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       1
     [2] OUTPUT:
-        tensor:     0x16ef9eed8
+        tensor:     0x16da62f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
 
 --------------------------------------------------------------------------------
 TASK 12
@@ -541,17 +551,17 @@ TASK 12
   ARGUMENTS (num_args = 2)
   -------------------------
     [0] INPUT:
-        tensor:     0x16ef9eed8
+        tensor:     0x16da62f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
     [1] OUTPUT:
-        tensor:     0x16ef9ded8
+        tensor:     0x16da61f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
 
 --------------------------------------------------------------------------------
 TASK 13
@@ -573,22 +583,24 @@ TASK 13
 
   FANOUT LIST (consumers that depend on this task)
   ------------------------------------------------
-    fanout_count = 0
-    fanout[] = [] (no consumers)
+    fanout_count = 1
+    fanout[] = [14]
+    Consumers:
+      -> Task 14 (rowexpanddiv)
 
   ARGUMENTS (num_args = 2)
   -------------------------
     [0] INPUT:
-        tensor:     0x16ef9ded8
+        tensor:     0x16da61f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
     [1] OUTPUT:
-        tensor:     0x16ef9ced8
+        tensor:     0x16da60f38
         row_offset: 0
         col_offset: 0
-        rows:       8
+        rows:       32
         cols:       1
 
 --------------------------------------------------------------------------------
@@ -607,7 +619,7 @@ TASK 14
 
   FANIN COUNTER
   -------------
-    fanin = 1
+    fanin = 2
 
   FANOUT LIST (consumers that depend on this task)
   ------------------------------------------------
@@ -617,23 +629,23 @@ TASK 14
   ARGUMENTS (num_args = 3)
   -------------------------
     [0] INPUT:
-        tensor:     0x16ef9ded8
+        tensor:     0x16da61f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
     [1] INPUT:
-        tensor:     0x16ef9ced8
+        tensor:     0x16da60f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       1
     [2] OUTPUT:
-        tensor:     0x16efa0ed8
+        tensor:     0x16da64f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
 
 --------------------------------------------------------------------------------
 TASK 15
@@ -655,22 +667,24 @@ TASK 15
 
   FANOUT LIST (consumers that depend on this task)
   ------------------------------------------------
-    fanout_count = 0
-    fanout[] = [] (no consumers)
+    fanout_count = 1
+    fanout[] = [16]
+    Consumers:
+      -> Task 16 (rowexpandsub)
 
   ARGUMENTS (num_args = 2)
   -------------------------
     [0] INPUT:
-        tensor:     0x16efa1ed8
+        tensor:     0x16da65f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
     [1] OUTPUT:
-        tensor:     0x16ef9fed8
+        tensor:     0x16da63f38
         row_offset: 0
         col_offset: 0
-        rows:       8
+        rows:       32
         cols:       1
 
 --------------------------------------------------------------------------------
@@ -689,7 +703,7 @@ TASK 16
 
   FANIN COUNTER
   -------------
-    fanin = 0
+    fanin = 1
 
   FANOUT LIST (consumers that depend on this task)
   ------------------------------------------------
@@ -701,23 +715,23 @@ TASK 16
   ARGUMENTS (num_args = 3)
   -------------------------
     [0] INPUT:
-        tensor:     0x16efa1ed8
+        tensor:     0x16da65f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
     [1] INPUT:
-        tensor:     0x16ef9fed8
+        tensor:     0x16da63f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       1
     [2] OUTPUT:
-        tensor:     0x16ef9eed8
+        tensor:     0x16da62f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
 
 --------------------------------------------------------------------------------
 TASK 17
@@ -748,17 +762,17 @@ TASK 17
   ARGUMENTS (num_args = 2)
   -------------------------
     [0] INPUT:
-        tensor:     0x16ef9eed8
+        tensor:     0x16da62f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
     [1] OUTPUT:
-        tensor:     0x16ef9ded8
+        tensor:     0x16da61f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
 
 --------------------------------------------------------------------------------
 TASK 18
@@ -780,22 +794,24 @@ TASK 18
 
   FANOUT LIST (consumers that depend on this task)
   ------------------------------------------------
-    fanout_count = 0
-    fanout[] = [] (no consumers)
+    fanout_count = 1
+    fanout[] = [19]
+    Consumers:
+      -> Task 19 (rowexpanddiv)
 
   ARGUMENTS (num_args = 2)
   -------------------------
     [0] INPUT:
-        tensor:     0x16ef9ded8
+        tensor:     0x16da61f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
     [1] OUTPUT:
-        tensor:     0x16ef9ced8
+        tensor:     0x16da60f38
         row_offset: 0
         col_offset: 0
-        rows:       8
+        rows:       32
         cols:       1
 
 --------------------------------------------------------------------------------
@@ -814,7 +830,7 @@ TASK 19
 
   FANIN COUNTER
   -------------
-    fanin = 1
+    fanin = 2
 
   FANOUT LIST (consumers that depend on this task)
   ------------------------------------------------
@@ -824,23 +840,23 @@ TASK 19
   ARGUMENTS (num_args = 3)
   -------------------------
     [0] INPUT:
-        tensor:     0x16ef9ded8
+        tensor:     0x16da61f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
     [1] INPUT:
-        tensor:     0x16ef9ced8
+        tensor:     0x16da60f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       1
     [2] OUTPUT:
-        tensor:     0x16efa0ed8
+        tensor:     0x16da64f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
 
 --------------------------------------------------------------------------------
 TASK 20
@@ -862,22 +878,24 @@ TASK 20
 
   FANOUT LIST (consumers that depend on this task)
   ------------------------------------------------
-    fanout_count = 0
-    fanout[] = [] (no consumers)
+    fanout_count = 1
+    fanout[] = [21]
+    Consumers:
+      -> Task 21 (rowexpandsub)
 
   ARGUMENTS (num_args = 2)
   -------------------------
     [0] INPUT:
-        tensor:     0x16efa1ed8
+        tensor:     0x16da65f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
     [1] OUTPUT:
-        tensor:     0x16ef9fed8
+        tensor:     0x16da63f38
         row_offset: 0
         col_offset: 0
-        rows:       8
+        rows:       32
         cols:       1
 
 --------------------------------------------------------------------------------
@@ -896,7 +914,7 @@ TASK 21
 
   FANIN COUNTER
   -------------
-    fanin = 0
+    fanin = 1
 
   FANOUT LIST (consumers that depend on this task)
   ------------------------------------------------
@@ -908,23 +926,23 @@ TASK 21
   ARGUMENTS (num_args = 3)
   -------------------------
     [0] INPUT:
-        tensor:     0x16efa1ed8
+        tensor:     0x16da65f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
     [1] INPUT:
-        tensor:     0x16ef9fed8
+        tensor:     0x16da63f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       1
     [2] OUTPUT:
-        tensor:     0x16ef9eed8
+        tensor:     0x16da62f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
 
 --------------------------------------------------------------------------------
 TASK 22
@@ -955,17 +973,17 @@ TASK 22
   ARGUMENTS (num_args = 2)
   -------------------------
     [0] INPUT:
-        tensor:     0x16ef9eed8
+        tensor:     0x16da62f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
     [1] OUTPUT:
-        tensor:     0x16ef9ded8
+        tensor:     0x16da61f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
 
 --------------------------------------------------------------------------------
 TASK 23
@@ -987,22 +1005,24 @@ TASK 23
 
   FANOUT LIST (consumers that depend on this task)
   ------------------------------------------------
-    fanout_count = 0
-    fanout[] = [] (no consumers)
+    fanout_count = 1
+    fanout[] = [24]
+    Consumers:
+      -> Task 24 (rowexpanddiv)
 
   ARGUMENTS (num_args = 2)
   -------------------------
     [0] INPUT:
-        tensor:     0x16ef9ded8
+        tensor:     0x16da61f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
     [1] OUTPUT:
-        tensor:     0x16ef9ced8
+        tensor:     0x16da60f38
         row_offset: 0
         col_offset: 0
-        rows:       8
+        rows:       32
         cols:       1
 
 --------------------------------------------------------------------------------
@@ -1021,7 +1041,7 @@ TASK 24
 
   FANIN COUNTER
   -------------
-    fanin = 1
+    fanin = 2
 
   FANOUT LIST (consumers that depend on this task)
   ------------------------------------------------
@@ -1031,23 +1051,23 @@ TASK 24
   ARGUMENTS (num_args = 3)
   -------------------------
     [0] INPUT:
-        tensor:     0x16ef9ded8
+        tensor:     0x16da61f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
     [1] INPUT:
-        tensor:     0x16ef9ced8
+        tensor:     0x16da60f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       1
     [2] OUTPUT:
-        tensor:     0x16efa0ed8
+        tensor:     0x16da64f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
 
 --------------------------------------------------------------------------------
 TASK 25
@@ -1069,22 +1089,24 @@ TASK 25
 
   FANOUT LIST (consumers that depend on this task)
   ------------------------------------------------
-    fanout_count = 0
-    fanout[] = [] (no consumers)
+    fanout_count = 1
+    fanout[] = [26]
+    Consumers:
+      -> Task 26 (rowexpandsub)
 
   ARGUMENTS (num_args = 2)
   -------------------------
     [0] INPUT:
-        tensor:     0x16efa1ed8
+        tensor:     0x16da65f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
     [1] OUTPUT:
-        tensor:     0x16ef9fed8
+        tensor:     0x16da63f38
         row_offset: 0
         col_offset: 0
-        rows:       8
+        rows:       32
         cols:       1
 
 --------------------------------------------------------------------------------
@@ -1103,7 +1125,7 @@ TASK 26
 
   FANIN COUNTER
   -------------
-    fanin = 0
+    fanin = 1
 
   FANOUT LIST (consumers that depend on this task)
   ------------------------------------------------
@@ -1115,23 +1137,23 @@ TASK 26
   ARGUMENTS (num_args = 3)
   -------------------------
     [0] INPUT:
-        tensor:     0x16efa1ed8
+        tensor:     0x16da65f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
     [1] INPUT:
-        tensor:     0x16ef9fed8
+        tensor:     0x16da63f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       1
     [2] OUTPUT:
-        tensor:     0x16ef9eed8
+        tensor:     0x16da62f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
 
 --------------------------------------------------------------------------------
 TASK 27
@@ -1162,17 +1184,17 @@ TASK 27
   ARGUMENTS (num_args = 2)
   -------------------------
     [0] INPUT:
-        tensor:     0x16ef9eed8
+        tensor:     0x16da62f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
     [1] OUTPUT:
-        tensor:     0x16ef9ded8
+        tensor:     0x16da61f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
 
 --------------------------------------------------------------------------------
 TASK 28
@@ -1194,22 +1216,24 @@ TASK 28
 
   FANOUT LIST (consumers that depend on this task)
   ------------------------------------------------
-    fanout_count = 0
-    fanout[] = [] (no consumers)
+    fanout_count = 1
+    fanout[] = [29]
+    Consumers:
+      -> Task 29 (rowexpanddiv)
 
   ARGUMENTS (num_args = 2)
   -------------------------
     [0] INPUT:
-        tensor:     0x16ef9ded8
+        tensor:     0x16da61f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
     [1] OUTPUT:
-        tensor:     0x16ef9ced8
+        tensor:     0x16da60f38
         row_offset: 0
         col_offset: 0
-        rows:       8
+        rows:       32
         cols:       1
 
 --------------------------------------------------------------------------------
@@ -1228,7 +1252,7 @@ TASK 29
 
   FANIN COUNTER
   -------------
-    fanin = 1
+    fanin = 2
 
   FANOUT LIST (consumers that depend on this task)
   ------------------------------------------------
@@ -1238,23 +1262,23 @@ TASK 29
   ARGUMENTS (num_args = 3)
   -------------------------
     [0] INPUT:
-        tensor:     0x16ef9ded8
+        tensor:     0x16da61f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
     [1] INPUT:
-        tensor:     0x16ef9ced8
+        tensor:     0x16da60f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       1
     [2] OUTPUT:
-        tensor:     0x16efa0ed8
+        tensor:     0x16da64f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
 
 --------------------------------------------------------------------------------
 TASK 30
@@ -1276,22 +1300,24 @@ TASK 30
 
   FANOUT LIST (consumers that depend on this task)
   ------------------------------------------------
-    fanout_count = 0
-    fanout[] = [] (no consumers)
+    fanout_count = 1
+    fanout[] = [31]
+    Consumers:
+      -> Task 31 (rowexpandsub)
 
   ARGUMENTS (num_args = 2)
   -------------------------
     [0] INPUT:
-        tensor:     0x16efa1ed8
+        tensor:     0x16da65f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
     [1] OUTPUT:
-        tensor:     0x16ef9fed8
+        tensor:     0x16da63f38
         row_offset: 0
         col_offset: 0
-        rows:       8
+        rows:       32
         cols:       1
 
 --------------------------------------------------------------------------------
@@ -1310,7 +1336,7 @@ TASK 31
 
   FANIN COUNTER
   -------------
-    fanin = 0
+    fanin = 1
 
   FANOUT LIST (consumers that depend on this task)
   ------------------------------------------------
@@ -1322,23 +1348,23 @@ TASK 31
   ARGUMENTS (num_args = 3)
   -------------------------
     [0] INPUT:
-        tensor:     0x16efa1ed8
+        tensor:     0x16da65f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
     [1] INPUT:
-        tensor:     0x16ef9fed8
+        tensor:     0x16da63f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       1
     [2] OUTPUT:
-        tensor:     0x16ef9eed8
+        tensor:     0x16da62f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
 
 --------------------------------------------------------------------------------
 TASK 32
@@ -1369,17 +1395,17 @@ TASK 32
   ARGUMENTS (num_args = 2)
   -------------------------
     [0] INPUT:
-        tensor:     0x16ef9eed8
+        tensor:     0x16da62f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
     [1] OUTPUT:
-        tensor:     0x16ef9ded8
+        tensor:     0x16da61f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
 
 --------------------------------------------------------------------------------
 TASK 33
@@ -1401,22 +1427,24 @@ TASK 33
 
   FANOUT LIST (consumers that depend on this task)
   ------------------------------------------------
-    fanout_count = 0
-    fanout[] = [] (no consumers)
+    fanout_count = 1
+    fanout[] = [34]
+    Consumers:
+      -> Task 34 (rowexpanddiv)
 
   ARGUMENTS (num_args = 2)
   -------------------------
     [0] INPUT:
-        tensor:     0x16ef9ded8
+        tensor:     0x16da61f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
     [1] OUTPUT:
-        tensor:     0x16ef9ced8
+        tensor:     0x16da60f38
         row_offset: 0
         col_offset: 0
-        rows:       8
+        rows:       32
         cols:       1
 
 --------------------------------------------------------------------------------
@@ -1435,7 +1463,7 @@ TASK 34
 
   FANIN COUNTER
   -------------
-    fanin = 1
+    fanin = 2
 
   FANOUT LIST (consumers that depend on this task)
   ------------------------------------------------
@@ -1445,23 +1473,23 @@ TASK 34
   ARGUMENTS (num_args = 3)
   -------------------------
     [0] INPUT:
-        tensor:     0x16ef9ded8
+        tensor:     0x16da61f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
     [1] INPUT:
-        tensor:     0x16ef9ced8
+        tensor:     0x16da60f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       1
     [2] OUTPUT:
-        tensor:     0x16efa0ed8
+        tensor:     0x16da64f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
 
 --------------------------------------------------------------------------------
 TASK 35
@@ -1483,22 +1511,24 @@ TASK 35
 
   FANOUT LIST (consumers that depend on this task)
   ------------------------------------------------
-    fanout_count = 0
-    fanout[] = [] (no consumers)
+    fanout_count = 1
+    fanout[] = [36]
+    Consumers:
+      -> Task 36 (rowexpandsub)
 
   ARGUMENTS (num_args = 2)
   -------------------------
     [0] INPUT:
-        tensor:     0x16efa1ed8
+        tensor:     0x16da65f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
     [1] OUTPUT:
-        tensor:     0x16ef9fed8
+        tensor:     0x16da63f38
         row_offset: 0
         col_offset: 0
-        rows:       8
+        rows:       32
         cols:       1
 
 --------------------------------------------------------------------------------
@@ -1517,7 +1547,7 @@ TASK 36
 
   FANIN COUNTER
   -------------
-    fanin = 0
+    fanin = 1
 
   FANOUT LIST (consumers that depend on this task)
   ------------------------------------------------
@@ -1529,23 +1559,23 @@ TASK 36
   ARGUMENTS (num_args = 3)
   -------------------------
     [0] INPUT:
-        tensor:     0x16efa1ed8
+        tensor:     0x16da65f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
     [1] INPUT:
-        tensor:     0x16ef9fed8
+        tensor:     0x16da63f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       1
     [2] OUTPUT:
-        tensor:     0x16ef9eed8
+        tensor:     0x16da62f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
 
 --------------------------------------------------------------------------------
 TASK 37
@@ -1576,17 +1606,17 @@ TASK 37
   ARGUMENTS (num_args = 2)
   -------------------------
     [0] INPUT:
-        tensor:     0x16ef9eed8
+        tensor:     0x16da62f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
     [1] OUTPUT:
-        tensor:     0x16ef9ded8
+        tensor:     0x16da61f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
 
 --------------------------------------------------------------------------------
 TASK 38
@@ -1608,22 +1638,24 @@ TASK 38
 
   FANOUT LIST (consumers that depend on this task)
   ------------------------------------------------
-    fanout_count = 0
-    fanout[] = [] (no consumers)
+    fanout_count = 1
+    fanout[] = [39]
+    Consumers:
+      -> Task 39 (rowexpanddiv)
 
   ARGUMENTS (num_args = 2)
   -------------------------
     [0] INPUT:
-        tensor:     0x16ef9ded8
+        tensor:     0x16da61f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
     [1] OUTPUT:
-        tensor:     0x16ef9ced8
+        tensor:     0x16da60f38
         row_offset: 0
         col_offset: 0
-        rows:       8
+        rows:       32
         cols:       1
 
 --------------------------------------------------------------------------------
@@ -1642,7 +1674,7 @@ TASK 39
 
   FANIN COUNTER
   -------------
-    fanin = 1
+    fanin = 2
 
   FANOUT LIST (consumers that depend on this task)
   ------------------------------------------------
@@ -1652,42 +1684,42 @@ TASK 39
   ARGUMENTS (num_args = 3)
   -------------------------
     [0] INPUT:
-        tensor:     0x16ef9ded8
+        tensor:     0x16da61f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
     [1] INPUT:
-        tensor:     0x16ef9ced8
+        tensor:     0x16da60f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       1
     [2] OUTPUT:
-        tensor:     0x16efa0ed8
+        tensor:     0x16da64f38
         row_offset: 0
         col_offset: 0
-        rows:       8
-        cols:       8
+        rows:       32
+        cols:       128
 
 ================================================================================
 READY QUEUE
 ================================================================================
 
   Head:  0
-  Tail:  16
-  Count: 16
-  Queue: [0, 1, 5, 6, 10, 11, 15, 16, 20, 21, 25, 26, 30, 31, 35, 36]
+  Tail:  8
+  Count: 8
+  Queue: [0, 5, 10, 15, 20, 25, 30, 35]
 
 ================================================================================
 TENSOR MAP (non-empty buckets)
 ================================================================================
 
-  [bucket 3721] tensor=0x16efa0ed8, offset=[0,0], shape=[8,8] -> producer: Task 39
-  [bucket 3766] tensor=0x16ef9ced8, offset=[0,0], shape=[8,1] -> producer: Task 38
-  [bucket 7817] tensor=0x16ef9ded8, offset=[0,0], shape=[8,8] -> producer: Task 37
-  [bucket 11913] tensor=0x16ef9eed8, offset=[0,0], shape=[8,8] -> producer: Task 36
-  [bucket 16054] tensor=0x16ef9fed8, offset=[0,0], shape=[8,1] -> producer: Task 35
+  [bucket 3353] tensor=0x16da64f38, offset=[0,0], shape=[32,128] -> producer: Task 39
+  [bucket 3742] tensor=0x16da60f38, offset=[0,0], shape=[32,1] -> producer: Task 38
+  [bucket 7449] tensor=0x16da61f38, offset=[0,0], shape=[32,128] -> producer: Task 37
+  [bucket 11545] tensor=0x16da62f38, offset=[0,0], shape=[32,128] -> producer: Task 36
+  [bucket 16030] tensor=0x16da63f38, offset=[0,0], shape=[32,1] -> producer: Task 35
 
   Total tensor entries: 5
 
@@ -1696,68 +1728,84 @@ DEPENDENCY GRAPH (Producer -> Consumer)
 ================================================================================
 
   Task 0 (rowmax) [READY]
-  Task 1 (rowexpandsub) [READY]
+    └──> Task 1 (rowexpandsub)
+  Task 1 (rowexpandsub) [WAIT]
     └──> Task 2 (elem_exp)
   Task 2 (elem_exp) [WAIT]
     └──> Task 3 (rowsum)
     └──> Task 4 (rowexpanddiv)
   Task 3 (rowsum) [WAIT]
+    └──> Task 4 (rowexpanddiv)
   Task 4 (rowexpanddiv) [WAIT]
   Task 5 (rowmax) [READY]
-  Task 6 (rowexpandsub) [READY]
+    └──> Task 6 (rowexpandsub)
+  Task 6 (rowexpandsub) [WAIT]
     └──> Task 7 (elem_exp)
   Task 7 (elem_exp) [WAIT]
     └──> Task 8 (rowsum)
     └──> Task 9 (rowexpanddiv)
   Task 8 (rowsum) [WAIT]
+    └──> Task 9 (rowexpanddiv)
   Task 9 (rowexpanddiv) [WAIT]
   Task 10 (rowmax) [READY]
-  Task 11 (rowexpandsub) [READY]
+    └──> Task 11 (rowexpandsub)
+  Task 11 (rowexpandsub) [WAIT]
     └──> Task 12 (elem_exp)
   Task 12 (elem_exp) [WAIT]
     └──> Task 13 (rowsum)
     └──> Task 14 (rowexpanddiv)
   Task 13 (rowsum) [WAIT]
+    └──> Task 14 (rowexpanddiv)
   Task 14 (rowexpanddiv) [WAIT]
   Task 15 (rowmax) [READY]
-  Task 16 (rowexpandsub) [READY]
+    └──> Task 16 (rowexpandsub)
+  Task 16 (rowexpandsub) [WAIT]
     └──> Task 17 (elem_exp)
   Task 17 (elem_exp) [WAIT]
     └──> Task 18 (rowsum)
     └──> Task 19 (rowexpanddiv)
   Task 18 (rowsum) [WAIT]
+    └──> Task 19 (rowexpanddiv)
   Task 19 (rowexpanddiv) [WAIT]
   Task 20 (rowmax) [READY]
-  Task 21 (rowexpandsub) [READY]
+    └──> Task 21 (rowexpandsub)
+  Task 21 (rowexpandsub) [WAIT]
     └──> Task 22 (elem_exp)
   Task 22 (elem_exp) [WAIT]
     └──> Task 23 (rowsum)
     └──> Task 24 (rowexpanddiv)
   Task 23 (rowsum) [WAIT]
+    └──> Task 24 (rowexpanddiv)
   Task 24 (rowexpanddiv) [WAIT]
   Task 25 (rowmax) [READY]
-  Task 26 (rowexpandsub) [READY]
+    └──> Task 26 (rowexpandsub)
+  Task 26 (rowexpandsub) [WAIT]
     └──> Task 27 (elem_exp)
   Task 27 (elem_exp) [WAIT]
     └──> Task 28 (rowsum)
     └──> Task 29 (rowexpanddiv)
   Task 28 (rowsum) [WAIT]
+    └──> Task 29 (rowexpanddiv)
   Task 29 (rowexpanddiv) [WAIT]
   Task 30 (rowmax) [READY]
-  Task 31 (rowexpandsub) [READY]
+    └──> Task 31 (rowexpandsub)
+  Task 31 (rowexpandsub) [WAIT]
     └──> Task 32 (elem_exp)
   Task 32 (elem_exp) [WAIT]
     └──> Task 33 (rowsum)
     └──> Task 34 (rowexpanddiv)
   Task 33 (rowsum) [WAIT]
+    └──> Task 34 (rowexpanddiv)
   Task 34 (rowexpanddiv) [WAIT]
   Task 35 (rowmax) [READY]
-  Task 36 (rowexpandsub) [READY]
+    └──> Task 36 (rowexpandsub)
+  Task 36 (rowexpandsub) [WAIT]
     └──> Task 37 (elem_exp)
   Task 37 (elem_exp) [WAIT]
     └──> Task 38 (rowsum)
     └──> Task 39 (rowexpanddiv)
   Task 38 (rowsum) [WAIT]
+    └──> Task 39 (rowexpanddiv)
   Task 39 (rowexpanddiv) [WAIT]
 
 ================================================================================

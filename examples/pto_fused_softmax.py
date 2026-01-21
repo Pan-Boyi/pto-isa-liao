@@ -303,29 +303,49 @@ def main():
     print(f"\n  [PTO] -> {pto_file}")
     
     # ==========================================================================
-    # Step 2: Generate code for all functions using MultiBackendCodeGenerator
+    # Step 2: Generate code for all backends
     # ==========================================================================
     print("\n" + "=" * 70)
-    print("Step 2: Generate Code for All Functions")
+    print("Step 2: Generate Code for All Backends")
     print("=" * 70)
     
+    # Create output directories
     arm64_dir = os.path.join(output_base, "output_arm64", "fused_softmax")
+    ascend_dir = os.path.join(output_base, "output_ascend910b", "fused_softmax")
+    cuda_dir = os.path.join(output_base, "output_cuda", "fused_softmax")
     os.makedirs(arm64_dir, exist_ok=True)
+    os.makedirs(ascend_dir, exist_ok=True)
+    os.makedirs(cuda_dir, exist_ok=True)
     
     # Create generator with module reference (for buffer analysis tracking)
     gen = MultiBackendCodeGenerator(enable_fusion=True, analyze_buffers=True, module=module)
     
-    # Generate code for all functions
-    # InCore functions: generate actual computation code
-    # Orchestration functions: generate task graph building code
+    # Generate code for all functions on all backends
     for func_name in module.get_function_names():
         func = module.get_function(func_name)
+        func_type = "InCore" if func.is_in_core else "Orchestration"
+        
+        # ARM64 (NEON)
         arm64_code = gen.generate_arm64(func)
         func_file = os.path.join(arm64_dir, f"{func_name}.c")
         with open(func_file, "w") as f:
             f.write(arm64_code)
-        func_type = "InCore" if func.is_in_core else "Orchestration"
         print(f"  [ARM64] {func_name} ({func_type}) -> {func_file}")
+        
+        # Ascend 910B (only for InCore functions)
+        if func.is_in_core:
+            ascend_code = gen.generate_ascend(func)
+            func_file = os.path.join(ascend_dir, f"{func_name}.cpp")
+            with open(func_file, "w") as f:
+                f.write(ascend_code)
+            print(f"  [Ascend910B] {func_name} ({func_type}) -> {func_file}")
+            
+            # CUDA
+            cuda_code = gen.generate_cuda(func)
+            func_file = os.path.join(cuda_dir, f"{func_name}.cu")
+            with open(func_file, "w") as f:
+                f.write(cuda_code)
+            print(f"  [CUDA] {func_name} ({func_type}) -> {func_file}")
     
     # ==========================================================================
     # Step 3: Compile and Run Orchestration to Build Task Graph
@@ -347,6 +367,38 @@ def main():
         print(f"\n  Task graph dump: {dump_file}")
     
     # ==========================================================================
+    # Step 4: Visualize Task Graph
+    # ==========================================================================
+    print("\n" + "=" * 70)
+    print("Step 4: Visualize Task Graph")
+    print("=" * 70)
+    
+    pdf_file = None
+    if dump_file and os.path.exists(dump_file):
+        # Import visualization tool
+        sys.path.insert(0, os.path.dirname(output_base))
+        try:
+            from visualize_taskgraph import TaskGraphParser, TaskGraphVisualizer
+            
+            # Parse and visualize
+            parser = TaskGraphParser(dump_file)
+            parser.parse()
+            
+            visualizer = TaskGraphVisualizer(parser)
+            pdf_base = dump_file.replace('.txt', '')
+            pdf_file = visualizer.render(pdf_base, format='pdf')
+            
+            print(f"  [PDF] Task graph visualization: {pdf_file}")
+            print(f"  Total tasks: {len(parser.tasks)}")
+            print(f"  Dependencies: {len(parser.edges)}")
+            
+        except ImportError as e:
+            print(f"  Warning: Could not import visualize_taskgraph: {e}")
+            print(f"  Install graphviz: pip install graphviz && brew install graphviz")
+        except Exception as e:
+            print(f"  Warning: Could not generate PDF: {e}")
+    
+    # ==========================================================================
     # Summary
     # ==========================================================================
     print("\n" + "=" * 70)
@@ -355,9 +407,13 @@ def main():
     
     print("\nGenerated files:")
     print(f"  PTO Assembly: {pto_file}")
-    print(f"  ARM64 InCore functions: {arm64_dir}/{{rowmax,rowexpandsub,elem_exp,rowsum,rowexpanddiv}}.c")
-    print(f"  Orchestration code: {arm64_dir}/dynamic_softmax_orchestration.c")
+    print(f"  ARM64 InCore: {arm64_dir}/{{rowmax,rowexpandsub,elem_exp,rowsum,rowexpanddiv}}.c")
+    print(f"  Ascend 910B InCore: {ascend_dir}/{{rowmax,rowexpandsub,elem_exp,rowsum,rowexpanddiv}}.cpp")
+    print(f"  CUDA InCore: {cuda_dir}/{{rowmax,rowexpandsub,elem_exp,rowsum,rowexpanddiv}}.cu")
+    print(f"  Orchestration: {arm64_dir}/dynamic_softmax_orchestration.c")
     print(f"  Task graph dump: {dump_file}")
+    if pdf_file:
+        print(f"  Task graph PDF: {pdf_file}")
     
     return module
 
