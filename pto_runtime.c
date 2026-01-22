@@ -39,11 +39,22 @@ void pto_runtime_init(PTORuntime* rt) {
     // Initialize tensor map
     memset(rt->tensor_map, 0, sizeof(rt->tensor_map));
     
-    // Initialize ready queue
+    // Initialize legacy ready queue
     memset(rt->ready_queue, 0, sizeof(rt->ready_queue));
     rt->ready_head = 0;
     rt->ready_tail = 0;
     rt->ready_count = 0;
+    
+    // Initialize dual ready queues (for a2a3_sim mode)
+    memset(rt->vector_ready_queue, 0, sizeof(rt->vector_ready_queue));
+    rt->vector_ready_head = 0;
+    rt->vector_ready_tail = 0;
+    rt->vector_ready_count = 0;
+    
+    memset(rt->cube_ready_queue, 0, sizeof(rt->cube_ready_queue));
+    rt->cube_ready_head = 0;
+    rt->cube_ready_tail = 0;
+    rt->cube_ready_count = 0;
     
     // Initialize statistics
     rt->total_tasks_scheduled = 0;
@@ -54,17 +65,43 @@ void pto_runtime_init(PTORuntime* rt) {
     pthread_mutex_init(&rt->task_mutex, NULL);
     pthread_cond_init(&rt->queue_not_empty, NULL);
     pthread_cond_init(&rt->all_done, NULL);
+    pthread_cond_init(&rt->vector_queue_not_empty, NULL);
+    pthread_cond_init(&rt->cube_queue_not_empty, NULL);
     
     // Initialize worker state
     rt->num_workers = 0;
+    rt->num_vector_workers = 0;
+    rt->num_cube_workers = 0;
     rt->shutdown_requested = false;
     rt->execution_started = false;
     rt->execution_task_threshold = 0;
+    rt->simulation_mode = false;
+    rt->dual_queue_mode = false;
     memset(rt->workers, 0, sizeof(rt->workers));
     memset(rt->func_registry, 0, sizeof(rt->func_registry));
     
     DEBUG_PRINT("[PTO Runtime] Initialized (max_tasks=%d, tensormap_size=%d)\n",
            PTO_MAX_TASKS, PTO_TENSORMAP_SIZE);
+}
+
+void pto_runtime_enable_simulation(PTORuntime* rt, int32_t num_workers) {
+    if (!rt) return;
+    rt->simulation_mode = true;
+    rt->dual_queue_mode = false;
+    pto_trace_init(num_workers > 0 ? num_workers : 1);
+    DEBUG_PRINT("[PTO Runtime] Simulation mode enabled with %d workers\n", num_workers);
+}
+
+void pto_runtime_enable_a2a3_sim(PTORuntime* rt, int32_t num_vector_workers, int32_t num_cube_workers) {
+    if (!rt) return;
+    rt->simulation_mode = true;
+    rt->dual_queue_mode = true;
+    rt->num_vector_workers = num_vector_workers;
+    rt->num_cube_workers = num_cube_workers;
+    int total_workers = num_vector_workers + num_cube_workers;
+    pto_trace_init(total_workers > 0 ? total_workers : 1);
+    DEBUG_PRINT("[PTO Runtime] A2A3 simulation mode enabled: %d vector workers, %d cube workers\n", 
+           num_vector_workers, num_cube_workers);
 }
 
 void pto_runtime_shutdown(PTORuntime* rt) {
@@ -78,6 +115,8 @@ void pto_runtime_shutdown(PTORuntime* rt) {
     pthread_mutex_destroy(&rt->task_mutex);
     pthread_cond_destroy(&rt->queue_not_empty);
     pthread_cond_destroy(&rt->all_done);
+    pthread_cond_destroy(&rt->vector_queue_not_empty);
+    pthread_cond_destroy(&rt->cube_queue_not_empty);
     
     DEBUG_PRINT("[PTO Runtime] Shutdown (scheduled=%lld, completed=%lld)\n",
            (long long)rt->total_tasks_scheduled,
@@ -187,6 +226,72 @@ static int32_t ready_queue_pop(PTORuntime* rt) {
 }
 
 // =============================================================================
+// Dual Ready Queue Implementation (for a2a3_sim mode)
+// =============================================================================
+
+static void vector_ready_queue_push(PTORuntime* rt, int32_t task_id) {
+    if (rt->vector_ready_count >= PTO_MAX_READY_QUEUE) {
+        fprintf(stderr, "[PTO Runtime] ERROR: Vector ready queue overflow\n");
+        return;
+    }
+    
+    rt->vector_ready_queue[rt->vector_ready_tail] = task_id;
+    rt->vector_ready_tail = (rt->vector_ready_tail + 1) % PTO_MAX_READY_QUEUE;
+    rt->vector_ready_count++;
+}
+
+static int32_t vector_ready_queue_pop(PTORuntime* rt) {
+    if (rt->vector_ready_count == 0) {
+        return -1;
+    }
+    
+    int32_t task_id = rt->vector_ready_queue[rt->vector_ready_head];
+    rt->vector_ready_head = (rt->vector_ready_head + 1) % PTO_MAX_READY_QUEUE;
+    rt->vector_ready_count--;
+    return task_id;
+}
+
+static void cube_ready_queue_push(PTORuntime* rt, int32_t task_id) {
+    if (rt->cube_ready_count >= PTO_MAX_READY_QUEUE) {
+        fprintf(stderr, "[PTO Runtime] ERROR: Cube ready queue overflow\n");
+        return;
+    }
+    
+    rt->cube_ready_queue[rt->cube_ready_tail] = task_id;
+    rt->cube_ready_tail = (rt->cube_ready_tail + 1) % PTO_MAX_READY_QUEUE;
+    rt->cube_ready_count++;
+}
+
+static int32_t cube_ready_queue_pop(PTORuntime* rt) {
+    if (rt->cube_ready_count == 0) {
+        return -1;
+    }
+    
+    int32_t task_id = rt->cube_ready_queue[rt->cube_ready_head];
+    rt->cube_ready_head = (rt->cube_ready_head + 1) % PTO_MAX_READY_QUEUE;
+    rt->cube_ready_count--;
+    return task_id;
+}
+
+// Push to appropriate queue based on task's is_cube flag
+static void dual_ready_queue_push(PTORuntime* rt, int32_t task_id) {
+    // Get is_cube from task or compact task
+    bool is_cube = false;
+    CompactTask* ct = &rt->compact_task[task_id];
+    if (ct->template_ref != NULL) {
+        is_cube = ct->template_ref->is_cube;
+    } else {
+        is_cube = rt->pend_task[task_id].is_cube;
+    }
+    
+    if (is_cube) {
+        cube_ready_queue_push(rt, task_id);
+    } else {
+        vector_ready_queue_push(rt, task_id);
+    }
+}
+
+// =============================================================================
 // Thread-safe Ready Queue Operations
 // =============================================================================
 
@@ -281,11 +386,142 @@ int32_t pto_get_ready_task_blocking(PTORuntime* rt) {
 }
 
 // =============================================================================
+// Thread-safe Dual Queue Operations (for a2a3_sim mode)
+// =============================================================================
+
+static void dual_ready_queue_push_threadsafe(PTORuntime* rt, int32_t task_id) {
+    pthread_mutex_lock(&rt->queue_mutex);
+    
+    // Get is_cube from task or compact task
+    bool is_cube = false;
+    CompactTask* ct = &rt->compact_task[task_id];
+    if (ct->template_ref != NULL) {
+        is_cube = ct->template_ref->is_cube;
+    } else {
+        is_cube = rt->pend_task[task_id].is_cube;
+    }
+    
+    if (is_cube) {
+        if (rt->cube_ready_count >= PTO_MAX_READY_QUEUE) {
+            fprintf(stderr, "[PTO Runtime] ERROR: Cube ready queue overflow\n");
+            pthread_mutex_unlock(&rt->queue_mutex);
+            return;
+        }
+        rt->cube_ready_queue[rt->cube_ready_tail] = task_id;
+        rt->cube_ready_tail = (rt->cube_ready_tail + 1) % PTO_MAX_READY_QUEUE;
+        rt->cube_ready_count++;
+        pthread_cond_broadcast(&rt->cube_queue_not_empty);
+        DEBUG_PRINT("[Queue] task %d pushed to cube queue (count=%d)\n", task_id, rt->cube_ready_count);
+    } else {
+        if (rt->vector_ready_count >= PTO_MAX_READY_QUEUE) {
+            fprintf(stderr, "[PTO Runtime] ERROR: Vector ready queue overflow\n");
+            pthread_mutex_unlock(&rt->queue_mutex);
+            return;
+        }
+        rt->vector_ready_queue[rt->vector_ready_tail] = task_id;
+        rt->vector_ready_tail = (rt->vector_ready_tail + 1) % PTO_MAX_READY_QUEUE;
+        rt->vector_ready_count++;
+        pthread_cond_broadcast(&rt->vector_queue_not_empty);
+        DEBUG_PRINT("[Queue] task %d pushed to vector queue (count=%d)\n", task_id, rt->vector_ready_count);
+    }
+    
+    pthread_mutex_unlock(&rt->queue_mutex);
+}
+
+int32_t pto_get_ready_task_vector(PTORuntime* rt) {
+    return vector_ready_queue_pop(rt);
+}
+
+int32_t pto_get_ready_task_cube(PTORuntime* rt) {
+    return cube_ready_queue_pop(rt);
+}
+
+int32_t pto_get_ready_task_vector_blocking(PTORuntime* rt) {
+    pthread_mutex_lock(&rt->queue_mutex);
+    
+    bool can_execute = rt->execution_started || 
+                       (rt->execution_task_threshold > 0 && 
+                        rt->total_tasks_scheduled > rt->execution_task_threshold);
+    
+    while ((rt->vector_ready_count == 0 || !can_execute) && !rt->shutdown_requested) {
+        if (rt->execution_started && rt->total_tasks_completed >= rt->total_tasks_scheduled) {
+            pthread_mutex_unlock(&rt->queue_mutex);
+            return -1;
+        }
+        
+        struct timespec timeout;
+        clock_gettime(CLOCK_REALTIME, &timeout);
+        timeout.tv_nsec += 100000;
+        if (timeout.tv_nsec >= 1000000000) {
+            timeout.tv_sec++;
+            timeout.tv_nsec -= 1000000000;
+        }
+        pthread_cond_timedwait(&rt->vector_queue_not_empty, &rt->queue_mutex, &timeout);
+        
+        can_execute = rt->execution_started || 
+                      (rt->execution_task_threshold > 0 && 
+                       rt->total_tasks_scheduled > rt->execution_task_threshold);
+    }
+    
+    if (rt->shutdown_requested || rt->vector_ready_count == 0) {
+        pthread_mutex_unlock(&rt->queue_mutex);
+        return -1;
+    }
+    
+    int32_t task_id = rt->vector_ready_queue[rt->vector_ready_head];
+    rt->vector_ready_head = (rt->vector_ready_head + 1) % PTO_MAX_READY_QUEUE;
+    rt->vector_ready_count--;
+    
+    pthread_mutex_unlock(&rt->queue_mutex);
+    return task_id;
+}
+
+int32_t pto_get_ready_task_cube_blocking(PTORuntime* rt) {
+    pthread_mutex_lock(&rt->queue_mutex);
+    
+    bool can_execute = rt->execution_started || 
+                       (rt->execution_task_threshold > 0 && 
+                        rt->total_tasks_scheduled > rt->execution_task_threshold);
+    
+    while ((rt->cube_ready_count == 0 || !can_execute) && !rt->shutdown_requested) {
+        if (rt->execution_started && rt->total_tasks_completed >= rt->total_tasks_scheduled) {
+            pthread_mutex_unlock(&rt->queue_mutex);
+            return -1;
+        }
+        
+        struct timespec timeout;
+        clock_gettime(CLOCK_REALTIME, &timeout);
+        timeout.tv_nsec += 100000;
+        if (timeout.tv_nsec >= 1000000000) {
+            timeout.tv_sec++;
+            timeout.tv_nsec -= 1000000000;
+        }
+        pthread_cond_timedwait(&rt->cube_queue_not_empty, &rt->queue_mutex, &timeout);
+        
+        can_execute = rt->execution_started || 
+                      (rt->execution_task_threshold > 0 && 
+                       rt->total_tasks_scheduled > rt->execution_task_threshold);
+    }
+    
+    if (rt->shutdown_requested || rt->cube_ready_count == 0) {
+        pthread_mutex_unlock(&rt->queue_mutex);
+        return -1;
+    }
+    
+    int32_t task_id = rt->cube_ready_queue[rt->cube_ready_head];
+    rt->cube_ready_head = (rt->cube_ready_head + 1) % PTO_MAX_READY_QUEUE;
+    rt->cube_ready_count--;
+    
+    pthread_mutex_unlock(&rt->queue_mutex);
+    return task_id;
+}
+
+// =============================================================================
 // Task Management
 // =============================================================================
 
-int32_t pto_task_alloc(PTORuntime* rt, const char* func_name, void* func_ptr,
-                       int32_t buffer_bytes, int32_t reuse_bytes) {
+int32_t pto_task_alloc_impl(PTORuntime* rt, const char* func_name, void* func_ptr,
+                            int32_t buffer_bytes, int32_t reuse_bytes, bool is_cube) {
     if (rt->next_task_id >= PTO_MAX_TASKS) {
         fprintf(stderr, "[PTO Runtime] ERROR: Task table full\n");
         return -1;
@@ -298,6 +534,7 @@ int32_t pto_task_alloc(PTORuntime* rt, const char* func_name, void* func_ptr,
     task->task_id = task_id;
     task->func_name = func_name;
     task->func_ptr = func_ptr;
+    task->cycle_func = NULL;  // Set via pto_task_set_cycle_func if needed
     task->num_args = 0;
     task->buffer_size_bytes = buffer_bytes;
     task->buffer_size_with_reuse = reuse_bytes;
@@ -305,6 +542,9 @@ int32_t pto_task_alloc(PTORuntime* rt, const char* func_name, void* func_ptr,
     task->fanout_count = 0;
     task->is_active = true;
     task->is_complete = false;
+    task->is_cube = is_cube;
+    task->earliest_start_cycle = 0;  // No deps yet, can start immediately
+    task->end_cycle = 0;
     
     // Clear fanout list
     memset(task->fanout, 0, sizeof(task->fanout));
@@ -312,10 +552,15 @@ int32_t pto_task_alloc(PTORuntime* rt, const char* func_name, void* func_ptr,
     rt->active_task_count++;
     rt->total_tasks_scheduled++;
     
-    DEBUG_PRINT("[PTO Runtime] Allocated task %d: %s (buf=%d B, reuse=%d B)\n", 
-           task_id, func_name, buffer_bytes, reuse_bytes);
+    DEBUG_PRINT("[PTO Runtime] Allocated task %d: %s (buf=%d B, reuse=%d B, is_cube=%d)\n", 
+           task_id, func_name, buffer_bytes, reuse_bytes, is_cube);
     
     return task_id;
+}
+
+void pto_task_set_cycle_func(PTORuntime* rt, int32_t task_id, CycleCostFunc cycle_func) {
+    if (!rt || task_id < 0 || task_id >= rt->next_task_id) return;
+    rt->pend_task[task_id].cycle_func = cycle_func;
 }
 
 void pto_task_add_input(PTORuntime* rt, int32_t task_id,
@@ -428,13 +673,17 @@ void pto_task_submit(PTORuntime* rt, int32_t task_id) {
     
     PendingTask* task = &rt->pend_task[task_id];
     
-    DEBUG_PRINT("[PTO Runtime] Submitted task %d: %s (fanin=%d, fanout=%d)\n",
-           task_id, task->func_name, task->fanin, task->fanout_count);
+    DEBUG_PRINT("[PTO Runtime] Submitted task %d: %s (fanin=%d, fanout=%d, is_cube=%d)\n",
+           task_id, task->func_name, task->fanin, task->fanout_count, task->is_cube);
     
     // If no dependencies, add directly to ready queue (thread-safe)
     // This allows workers to start executing immediately
     if (task->fanin == 0) {
-        ready_queue_push_threadsafe(rt, task_id);
+        if (rt->dual_queue_mode) {
+            dual_ready_queue_push_threadsafe(rt, task_id);
+        } else {
+            ready_queue_push_threadsafe(rt, task_id);
+        }
         DEBUG_PRINT("[PTO Runtime] Task %d is ready (no dependencies)\n", task_id);
     }
     // Tasks with fanin > 0 stay in pend_task until dependencies complete
@@ -458,19 +707,22 @@ void pto_task_complete(PTORuntime* rt, int32_t task_id) {
     rt->active_task_count--;
     rt->total_tasks_completed++;
     
-    // Get fanout info from appropriate source
+    // Get fanout info and end_cycle from appropriate source
     int32_t fanout_count;
     int32_t* fanout;
     const char* func_name;
+    int64_t producer_end_cycle;
     
     if (is_compact) {
         fanout_count = ct->template_ref->fanout_count;
         fanout = ct->template_ref->fanout;  // Relative offsets
         func_name = ct->template_ref->func_name;
+        producer_end_cycle = ct->earliest_start_cycle;  // Will be updated in execute_task
     } else {
         fanout_count = rt->pend_task[task_id].fanout_count;
         fanout = rt->pend_task[task_id].fanout;  // Absolute IDs
         func_name = rt->pend_task[task_id].func_name;
+        producer_end_cycle = rt->pend_task[task_id].end_cycle;
     }
     
     DEBUG_PRINT("[PTO Runtime] Completed task %d: %s\n", task_id, func_name);
@@ -484,13 +736,26 @@ void pto_task_complete(PTORuntime* rt, int32_t task_id) {
         CompactTask* dep_ct = &rt->compact_task[dep_id];
         bool dep_is_compact = (dep_ct->template_ref != NULL);
         
+        // Update earliest_start_cycle of dependent task
+        // It can't start until after this producer finishes
+        if (dep_is_compact) {
+            if (producer_end_cycle > dep_ct->earliest_start_cycle) {
+                dep_ct->earliest_start_cycle = producer_end_cycle;
+            }
+        } else {
+            if (producer_end_cycle > rt->pend_task[dep_id].earliest_start_cycle) {
+                rt->pend_task[dep_id].earliest_start_cycle = producer_end_cycle;
+            }
+        }
+        
         bool is_ready = false;
         if (dep_is_compact) {
-            // Compact task: INCREMENT resolved_fanin, compare with template->fanin
+            // Compact task: INCREMENT resolved_fanin, compare with template->internal_fanin
+            // We use internal_fanin (deps within fragment) for replay tasks
             dep_ct->resolved_fanin++;
-            is_ready = (dep_ct->resolved_fanin >= dep_ct->template_ref->fanin);
+            is_ready = (dep_ct->resolved_fanin >= dep_ct->template_ref->internal_fanin);
             DEBUG_PRINT("[PTO Runtime] Task %d resolved_fanin=%d/%d\n", 
-                   dep_id, dep_ct->resolved_fanin, dep_ct->template_ref->fanin);
+                   dep_id, dep_ct->resolved_fanin, dep_ct->template_ref->internal_fanin);
         } else {
             // Regular task: DECREMENT fanin
             rt->pend_task[dep_id].fanin--;
@@ -503,7 +768,11 @@ void pto_task_complete(PTORuntime* rt, int32_t task_id) {
         bool dep_complete = dep_is_compact ? dep_ct->is_complete : rt->pend_task[dep_id].is_complete;
         
         if (is_ready && !dep_complete) {
-            ready_queue_push(rt, dep_id);
+            if (rt->dual_queue_mode) {
+                dual_ready_queue_push(rt, dep_id);
+            } else {
+                ready_queue_push(rt, dep_id);
+            }
             DEBUG_PRINT("[PTO Runtime] Task %d is now ready\n", dep_id);
         }
     }
@@ -566,10 +835,10 @@ void pto_task_complete_threadsafe(PTORuntime* rt, int32_t task_id) {
         
         if (dep_is_compact) {
             dep_ct->resolved_fanin++;
-            is_ready = (dep_ct->resolved_fanin >= dep_ct->template_ref->fanin);
+            is_ready = (dep_ct->resolved_fanin >= dep_ct->template_ref->internal_fanin);
             dep_complete = dep_ct->is_complete;
             DEBUG_PRINT("[PTO Runtime] Task %d resolved_fanin=%d/%d\n", 
-                   dep_id, dep_ct->resolved_fanin, dep_ct->template_ref->fanin);
+                   dep_id, dep_ct->resolved_fanin, dep_ct->template_ref->internal_fanin);
         } else {
             rt->pend_task[dep_id].fanin--;
             is_ready = (rt->pend_task[dep_id].fanin == 0);
@@ -590,7 +859,11 @@ void pto_task_complete_threadsafe(PTORuntime* rt, int32_t task_id) {
     
     // Add newly ready tasks to queue (outside task_mutex to avoid deadlock)
     for (int i = 0; i < newly_ready_count; i++) {
-        ready_queue_push_threadsafe(rt, newly_ready[i]);
+        if (rt->dual_queue_mode) {
+            dual_ready_queue_push_threadsafe(rt, newly_ready[i]);
+        } else {
+            ready_queue_push_threadsafe(rt, newly_ready[i]);
+        }
         DEBUG_PRINT("[PTO Runtime] Task %d is now ready\n", newly_ready[i]);
     }
     
@@ -599,6 +872,8 @@ void pto_task_complete_threadsafe(PTORuntime* rt, int32_t task_id) {
         pthread_mutex_lock(&rt->queue_mutex);
         pthread_cond_broadcast(&rt->all_done);
         pthread_cond_broadcast(&rt->queue_not_empty);
+        pthread_cond_broadcast(&rt->vector_queue_not_empty);
+        pthread_cond_broadcast(&rt->cube_queue_not_empty);
         pthread_mutex_unlock(&rt->queue_mutex);
     }
 }
@@ -938,15 +1213,23 @@ RecordedFragment* pto_fragment_record(PTORuntime* rt, int32_t start_id, int32_t 
         
         dst->func_name = src->func_name;
         dst->func_ptr = src->func_ptr;
+        dst->cycle_func = src->cycle_func;  // For simulation mode
         dst->buffer_size_bytes = src->buffer_size_bytes;
         dst->buffer_size_with_reuse = src->buffer_size_with_reuse;
         dst->fanin = src->fanin;
+        dst->internal_fanin = 0;  // Will be computed in second pass
         dst->num_args = src->num_args;
+        dst->is_cube = src->is_cube;  // Copy cube flag for a2a3_sim mode
         
         // Convert fanout to relative offsets for position-independence
-        dst->fanout_count = src->fanout_count;
+        // Only include fanouts that point to tasks within the fragment
+        dst->fanout_count = 0;
         for (int j = 0; j < src->fanout_count; j++) {
-            dst->fanout[j] = src->fanout[j] - (start_id + i);  // relative offset
+            int32_t abs_target = src->fanout[j];
+            // Check if target is within the fragment
+            if (abs_target >= start_id && abs_target < start_id + task_count) {
+                dst->fanout[dst->fanout_count++] = abs_target - (start_id + i);  // relative offset
+            }
         }
         
         // Copy arguments
@@ -964,6 +1247,19 @@ RecordedFragment* pto_fragment_record(PTORuntime* rt, int32_t start_id, int32_t 
         // Simple checksum
         for (int j = 0; j < dst->fanout_count; j++) {
             frag->checksum ^= dst->fanout[j] * (i + 1);
+        }
+    }
+    
+    // Second pass: compute internal_fanin by counting how many times each task
+    // is referenced by internal fanouts
+    for (int32_t i = 0; i < task_count; i++) {
+        RecordedTask* src_task = &frag->tasks[i];
+        for (int j = 0; j < src_task->fanout_count; j++) {
+            int32_t rel_target = src_task->fanout[j];
+            int32_t abs_target = i + rel_target;
+            if (abs_target >= 0 && abs_target < task_count) {
+                frag->tasks[abs_target].internal_fanin++;
+            }
         }
     }
     
@@ -1074,11 +1370,12 @@ void pto_loop_replay(PTORuntime* rt, LoopReplayCtx* ctx, int32_t loop_idx) {
         RecordedTask* src = &frag->tasks[i];
         int32_t task_id = base_id + i;
         
-        // Write only to compact_task array (24 bytes, fits in one cache line)
+        // Write only to compact_task array
         CompactTask* ct = &rt->compact_task[task_id];
         ct->template_ref = src;           // Point to immutable template
-        ct->resolved_fanin = 0;           // Incremented by producers
+        ct->resolved_fanin = 0;           // Start at 0, will be incremented by internal producers
         ct->offset_delta = offset_delta;  // Row offset for this replay
+        ct->earliest_start_cycle = 0;     // Will be updated by producers
         ct->is_complete = false;
         ct->is_active = true;
         
@@ -1112,11 +1409,17 @@ void pto_loop_replay(PTORuntime* rt, LoopReplayCtx* ctx, int32_t loop_idx) {
     
     rt->next_task_id = base_id + frag->task_count;
     
-    // Submit ready tasks (fanin == 0)
+    // Submit ready tasks (internal_fanin == 0)
+    // Note: We use internal_fanin (deps within fragment) instead of fanin (total deps)
+    // because external deps from the original iteration don't apply to replay iterations
     for (int32_t i = 0; i < frag->task_count; i++) {
         RecordedTask* tmpl = &frag->tasks[i];
-        if (tmpl->fanin == 0) {
-            ready_queue_push_threadsafe(rt, base_id + i);
+        if (tmpl->internal_fanin == 0) {
+            if (rt->dual_queue_mode) {
+                dual_ready_queue_push_threadsafe(rt, base_id + i);
+            } else {
+                ready_queue_push_threadsafe(rt, base_id + i);
+            }
         }
     }
     
@@ -1284,13 +1587,14 @@ typedef struct {
 /**
  * Execute a single task by calling its InCore function
  */
-static void execute_task(PTORuntime* rt, int32_t task_id) {
+static void execute_task_internal(PTORuntime* rt, int32_t task_id, int32_t worker_id) {
     // Check if this is a compact task (replay) or a regular task
     CompactTask* ct = &rt->compact_task[task_id];
     bool is_compact = (ct->template_ref != NULL);
     
     // Get task info from appropriate source
     void* func_ptr;
+    CycleCostFunc cycle_func;
     int32_t num_args;
     TaskArg* task_args;
     int32_t offset_delta;
@@ -1299,6 +1603,7 @@ static void execute_task(PTORuntime* rt, int32_t task_id) {
     if (is_compact) {
         RecordedTask* tmpl = ct->template_ref;
         func_ptr = tmpl->func_ptr;
+        cycle_func = tmpl->cycle_func;
         num_args = tmpl->num_args;
         task_args = tmpl->args;
         offset_delta = ct->offset_delta;  // Apply replay offset
@@ -1306,6 +1611,7 @@ static void execute_task(PTORuntime* rt, int32_t task_id) {
     } else {
         PendingTask* task = &rt->pend_task[task_id];
         func_ptr = task->func_ptr;
+        cycle_func = task->cycle_func;
         num_args = task->num_args;
         task_args = task->args;
         offset_delta = 0;
@@ -1315,38 +1621,74 @@ static void execute_task(PTORuntime* rt, int32_t task_id) {
     DEBUG_PRINT("[Worker] Executing task %d: %s%s\n", task_id, func_name,
            is_compact ? " (replay)" : "");
     
-    if (func_ptr) {
-        // Build argument array from task arguments
-        void* args[PTO_MAX_ARGS * 2];
-        int arg_idx = 0;
+    // Build argument array from task arguments
+    void* args[PTO_MAX_ARGS * 2];
+    int arg_idx = 0;
+    
+    for (int i = 0; i < num_args; i++) {
+        TaskArg* arg = &task_args[i];
+        float* base_ptr = (float*)arg->region.raw_tensor;
         
-        for (int i = 0; i < num_args; i++) {
-            TaskArg* arg = &task_args[i];
-            float* base_ptr = (float*)arg->region.raw_tensor;
-            
-            // Only apply offset_delta to tile-varying arguments
-            // Heuristic: if rows > 1 AND matches typical tile size, it's tile-varying
-            // Weights/constants typically have rows=1 or very small rows
-            // Also: if the original row_offset was non-zero, always apply delta
-            bool apply_offset = (offset_delta != 0) && 
-                               (arg->region.row_offset > 0 || arg->region.rows > 1);
-            
-            int64_t row_offset = arg->region.row_offset;
-            if (apply_offset) {
-                row_offset += offset_delta;
-            }
-            
-            int64_t offset = row_offset * arg->region.cols + arg->region.col_offset;
-            args[arg_idx++] = (void*)(base_ptr + offset);
+        // Only apply offset_delta to tile-varying arguments
+        // Heuristic: if rows > 1 AND matches typical tile size, it's tile-varying
+        // Weights/constants typically have rows=1 or very small rows
+        // Also: if the original row_offset was non-zero, always apply delta
+        bool apply_offset = (offset_delta != 0) && 
+                           (arg->region.row_offset > 0 || arg->region.rows > 1);
+        
+        int64_t row_offset = arg->region.row_offset;
+        if (apply_offset) {
+            row_offset += offset_delta;
         }
         
-        // Call the InCore function
+        int64_t offset = row_offset * arg->region.cols + arg->region.col_offset;
+        args[arg_idx++] = (void*)(base_ptr + offset);
+    }
+    
+    // Simulation mode: call cycle function and record trace
+    if (rt->simulation_mode && cycle_func) {
+        int64_t cycle_cost = cycle_func(args, num_args);
+        
+        // Get earliest_start_cycle for this task (set by producers in pto_task_complete)
+        int64_t task_earliest_start = is_compact ? 
+            ct->earliest_start_cycle : rt->pend_task[task_id].earliest_start_cycle;
+        
+        // Get worker's current cycle
+        int64_t worker_current = pto_trace_get_cycle(worker_id);
+        
+        // Actual start time = max(worker ready, dependencies satisfied)
+        int64_t actual_start = (worker_current > task_earliest_start) ? 
+            worker_current : task_earliest_start;
+        int64_t actual_end = actual_start + cycle_cost;
+        
+        // Update task's end_cycle (for propagating to dependents)
+        if (is_compact) {
+            ct->earliest_start_cycle = actual_end;  // Reuse field for end_cycle
+        } else {
+            rt->pend_task[task_id].end_cycle = actual_end;
+        }
+        
+        // Record with dependency-aware timing
+        pto_trace_record_with_time(worker_id, func_name, actual_start, actual_end);
+        DEBUG_PRINT("[Worker] Task %d: %s (simulated, %lld cycles, start=%lld)\n", 
+               task_id, func_name, (long long)cycle_cost, (long long)actual_start);
+    }
+    // Normal mode: call the InCore function
+    else if (func_ptr) {
         PTOInCoreFunc func = (PTOInCoreFunc)func_ptr;
         func(args, num_args);
     } else {
-        DEBUG_PRINT("[Worker] Task %d: %s (simulated - no func_ptr)\n", 
+        DEBUG_PRINT("[Worker] Task %d: %s (no execution - no func_ptr)\n", 
                task_id, func_name);
     }
+}
+
+static void execute_task(PTORuntime* rt, int32_t task_id) {
+    execute_task_internal(rt, task_id, 0);
+}
+
+void pto_execute_task_with_worker(PTORuntime* rt, int32_t task_id, int32_t worker_id) {
+    execute_task_internal(rt, task_id, worker_id);
 }
 
 /**
@@ -1356,7 +1698,7 @@ static void execute_task(PTORuntime* rt, int32_t task_id) {
 static void* worker_thread_func(void* arg) {
     WorkerContext* ctx = (WorkerContext*)arg;
     PTORuntime* rt = ctx->rt;
-    int worker_id __attribute__((unused)) = ctx->worker_id;
+    int worker_id = ctx->worker_id;
     
     DEBUG_PRINT("[Worker %d] Started\n", worker_id);
     fflush(stdout);
@@ -1378,8 +1720,8 @@ static void* worker_thread_func(void* arg) {
             continue;
         }
         
-        // Execute the task
-        execute_task(rt, task_id);
+        // Execute the task (pass worker_id for trace recording)
+        execute_task_internal(rt, task_id, worker_id);
         
         // Mark task as complete (updates dependencies, may wake other workers)
         pto_task_complete_threadsafe(rt, task_id);
@@ -1648,3 +1990,196 @@ int main() {
 }
 
 #endif // PTO_RUNTIME_EXAMPLE
+
+// =============================================================================
+// Cycle Trace Recording Implementation
+// =============================================================================
+
+CycleTrace* pto_global_trace = NULL;
+
+void pto_trace_init(int32_t num_workers) {
+    if (pto_global_trace) {
+        free(pto_global_trace);
+    }
+    pto_global_trace = (CycleTrace*)calloc(1, sizeof(CycleTrace));
+    if (!pto_global_trace) return;
+    
+    pto_global_trace->count = 0;
+    pto_global_trace->num_workers = num_workers > 0 ? num_workers : 1;
+    pto_global_trace->enabled = true;
+    
+    // Initialize per-worker cycle counters
+    for (int i = 0; i < PTO_MAX_WORKERS; i++) {
+        pto_global_trace->per_worker_cycle[i] = 0;
+    }
+}
+
+void pto_trace_record(int32_t worker_id, const char* func_name, int64_t cycle_cost) {
+    if (!pto_global_trace || !pto_global_trace->enabled) return;
+    if (pto_global_trace->count >= PTO_MAX_TRACE_ENTRIES) return;
+    if (worker_id < 0 || worker_id >= PTO_MAX_WORKERS) return;
+    
+    int idx = pto_global_trace->count++;
+    CycleTraceEntry* entry = &pto_global_trace->entries[idx];
+    
+    // Copy function name
+    strncpy(entry->func_name, func_name ? func_name : "unknown", PTO_MAX_FUNC_NAME_LEN - 1);
+    entry->func_name[PTO_MAX_FUNC_NAME_LEN - 1] = '\0';
+    
+    entry->worker_id = worker_id;
+    entry->start_cycle = pto_global_trace->per_worker_cycle[worker_id];
+    entry->end_cycle = entry->start_cycle + cycle_cost;
+    
+    // Update worker cycle counter
+    pto_global_trace->per_worker_cycle[worker_id] = entry->end_cycle;
+}
+
+void pto_trace_record_with_time(int32_t worker_id, const char* func_name, 
+                                 int64_t start_cycle, int64_t end_cycle) {
+    if (!pto_global_trace || !pto_global_trace->enabled) return;
+    if (pto_global_trace->count >= PTO_MAX_TRACE_ENTRIES) return;
+    if (worker_id < 0 || worker_id >= PTO_MAX_WORKERS) return;
+    
+    int idx = pto_global_trace->count++;
+    CycleTraceEntry* entry = &pto_global_trace->entries[idx];
+    
+    // Copy function name
+    strncpy(entry->func_name, func_name ? func_name : "unknown", PTO_MAX_FUNC_NAME_LEN - 1);
+    entry->func_name[PTO_MAX_FUNC_NAME_LEN - 1] = '\0';
+    
+    entry->worker_id = worker_id;
+    entry->start_cycle = start_cycle;
+    entry->end_cycle = end_cycle;
+    
+    // Update worker cycle counter to the end of this task
+    pto_global_trace->per_worker_cycle[worker_id] = end_cycle;
+}
+
+int64_t pto_trace_get_cycle(int32_t worker_id) {
+    if (!pto_global_trace) return 0;
+    if (worker_id < 0 || worker_id >= PTO_MAX_WORKERS) return 0;
+    return pto_global_trace->per_worker_cycle[worker_id];
+}
+
+void pto_trace_cleanup(void) {
+    if (pto_global_trace) {
+        free(pto_global_trace);
+        pto_global_trace = NULL;
+    }
+}
+
+char* pto_trace_to_chrome_json(void) {
+    if (!pto_global_trace) return NULL;
+    
+    // Estimate output size (generous allocation)
+    size_t buf_size = 1024 + pto_global_trace->count * 256;
+    char* buf = (char*)malloc(buf_size);
+    if (!buf) return NULL;
+    
+    char* ptr = buf;
+    ptr += sprintf(ptr, "{\n  \"traceEvents\": [\n");
+    
+    for (int i = 0; i < pto_global_trace->count; i++) {
+        CycleTraceEntry* e = &pto_global_trace->entries[i];
+        int64_t duration = e->end_cycle - e->start_cycle;
+        
+        // Chrome Tracing format (duration event)
+        ptr += sprintf(ptr, "    {\"name\": \"%s\", \"cat\": \"task\", \"ph\": \"X\", "
+                       "\"ts\": %lld, \"dur\": %lld, \"pid\": 0, \"tid\": %d}%s\n",
+                       e->func_name,
+                       (long long)(e->start_cycle),     // timestamp in microseconds (we use cycles)
+                       (long long)duration,              // duration
+                       e->worker_id,                     // thread ID = worker ID
+                       (i < pto_global_trace->count - 1) ? "," : "");
+    }
+    
+    ptr += sprintf(ptr, "  ],\n");
+    ptr += sprintf(ptr, "  \"displayTimeUnit\": \"ns\",\n");
+    ptr += sprintf(ptr, "  \"metadata\": {\n");
+    ptr += sprintf(ptr, "    \"num_workers\": %d,\n", pto_global_trace->num_workers);
+    ptr += sprintf(ptr, "    \"total_entries\": %d\n", pto_global_trace->count);
+    ptr += sprintf(ptr, "  }\n");
+    ptr += sprintf(ptr, "}\n");
+    
+    return buf;
+}
+
+void pto_trace_write_json(const char* filename) {
+    char* json = pto_trace_to_chrome_json();
+    if (!json) {
+        fprintf(stderr, "Error: Failed to generate trace JSON\n");
+        return;
+    }
+    
+    FILE* f = fopen(filename, "w");
+    if (!f) {
+        fprintf(stderr, "Error: Failed to open %s for writing\n", filename);
+        free(json);
+        return;
+    }
+    
+    fputs(json, f);
+    fclose(f);
+    free(json);
+    
+    printf("Trace written to: %s\n", filename);
+    printf("  Open in Chrome: chrome://tracing and load the file\n");
+}
+
+void pto_trace_print_summary(void) {
+    if (!pto_global_trace) {
+        printf("Trace: not initialized\n");
+        return;
+    }
+    
+    printf("\n=== Cycle Trace Summary ===\n");
+    printf("Total entries: %d\n", pto_global_trace->count);
+    printf("Num workers: %d\n", pto_global_trace->num_workers);
+    
+    // Per-worker statistics
+    int64_t max_cycle = 0;
+    for (int w = 0; w < pto_global_trace->num_workers; w++) {
+        int64_t cycle = pto_global_trace->per_worker_cycle[w];
+        printf("  Worker %d: %lld cycles\n", w, (long long)cycle);
+        if (cycle > max_cycle) max_cycle = cycle;
+    }
+    printf("Max cycle (makespan): %lld\n", (long long)max_cycle);
+    
+    // Function breakdown
+    printf("\nFunction breakdown:\n");
+    
+    // Simple aggregation (could be made more efficient with hash table)
+    typedef struct { char name[PTO_MAX_FUNC_NAME_LEN]; int64_t total_cycles; int count; } FuncStats;
+    FuncStats stats[100];
+    int num_stats = 0;
+    
+    for (int i = 0; i < pto_global_trace->count; i++) {
+        CycleTraceEntry* e = &pto_global_trace->entries[i];
+        int64_t dur = e->end_cycle - e->start_cycle;
+        
+        // Find or create entry
+        int found = -1;
+        for (int s = 0; s < num_stats; s++) {
+            if (strcmp(stats[s].name, e->func_name) == 0) {
+                found = s;
+                break;
+            }
+        }
+        
+        if (found >= 0) {
+            stats[found].total_cycles += dur;
+            stats[found].count++;
+        } else if (num_stats < 100) {
+            strncpy(stats[num_stats].name, e->func_name, PTO_MAX_FUNC_NAME_LEN - 1);
+            stats[num_stats].total_cycles = dur;
+            stats[num_stats].count = 1;
+            num_stats++;
+        }
+    }
+    
+    for (int s = 0; s < num_stats; s++) {
+        printf("  %s: %lld cycles (%d calls)\n", 
+               stats[s].name, (long long)stats[s].total_cycles, stats[s].count);
+    }
+    printf("===========================\n\n");
+}

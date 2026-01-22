@@ -28,11 +28,11 @@
 // Configuration
 // =============================================================================
 
-#define PTO_MAX_TASKS          262144  // Maximum pending tasks (256K for 16K+ seq)
+#define PTO_MAX_TASKS          524288  // Maximum pending tasks (512K for non-aligned seq)
 #define PTO_MAX_FANOUT         512     // Maximum fanout per task
 #define PTO_MAX_ARGS           16      // Maximum arguments per task
 #define PTO_TENSORMAP_SIZE     16384   // Hash table size for tensor map
-#define PTO_MAX_READY_QUEUE    65536   // Ready queue size (increased for large sequences)
+#define PTO_MAX_READY_QUEUE    262144  // Ready queue size (256K for large non-aligned sequences)
 #define PTO_MAX_WORKERS        64      // Maximum worker threads
 
 // =============================================================================
@@ -49,12 +49,13 @@
 struct RecordedTask;  // Forward declaration
 
 /**
- * Compact task entry for replay (24 bytes - cache friendly)
+ * Compact task entry for replay (32 bytes - cache friendly)
  */
 typedef struct {
     struct RecordedTask* template_ref;  // 8 bytes: immutable template
     int32_t  resolved_fanin;            // 4 bytes: incremented when deps complete
     int32_t  offset_delta;              // 4 bytes: row offset for this replay
+    int64_t  earliest_start_cycle;      // 8 bytes: for dependency-aware scheduling
     bool     is_complete;               // 1 byte
     bool     is_active;                 // 1 byte  
     int16_t  _padding;                  // 2 bytes alignment
@@ -87,10 +88,17 @@ typedef struct {
 /**
  * Pending task entry
  */
+/**
+ * Cycle cost function pointer type
+ * Returns estimated cycle count for the InCore function
+ */
+typedef int64_t (*CycleCostFunc)(void** args, int32_t num_args);
+
 typedef struct {
     int32_t      task_id;                    // Unique task identifier
     const char*  func_name;                  // InCore function to call
     void*        func_ptr;                   // Function pointer
+    CycleCostFunc cycle_func;                // Cycle cost function (for simulation mode)
     
     // Arguments
     TaskArg      args[PTO_MAX_ARGS];         // Input/output arguments
@@ -108,6 +116,13 @@ typedef struct {
     // Status
     bool         is_active;                  // Task slot is in use
     bool         is_complete;                // Task has finished execution
+    
+    // Worker type hint (for a2a3_sim backend)
+    bool         is_cube;                    // True if requires cube unit (matmul)
+    
+    // Timing (for dependency-aware simulation)
+    int64_t      earliest_start_cycle;       // Earliest time this task can start (after deps)
+    int64_t      end_cycle;                  // Time when this task finished
 } PendingTask;
 
 /**
@@ -132,11 +147,27 @@ typedef struct {
     // TensorMap for dependency tracking
     TensorMapEntry* tensor_map[PTO_TENSORMAP_SIZE];
     
-    // Ready queue (tasks with fanin == 0)
+    // Ready queue (tasks with fanin == 0) - legacy single queue for backward compat
     int32_t      ready_queue[PTO_MAX_READY_QUEUE];
     int32_t      ready_head;
     int32_t      ready_tail;
     int32_t      ready_count;
+    
+    // ==========================================================================
+    // Dual ready queues for a2a3_sim: vector (is_cube=0) and cube (is_cube=1)
+    // ==========================================================================
+    int32_t      vector_ready_queue[PTO_MAX_READY_QUEUE];  // is_cube=0 tasks
+    int32_t      vector_ready_head;
+    int32_t      vector_ready_tail;
+    int32_t      vector_ready_count;
+    
+    int32_t      cube_ready_queue[PTO_MAX_READY_QUEUE];    // is_cube=1 tasks
+    int32_t      cube_ready_head;
+    int32_t      cube_ready_tail;
+    int32_t      cube_ready_count;
+    
+    pthread_cond_t    vector_queue_not_empty;  // Signaled when vector task added
+    pthread_cond_t    cube_queue_not_empty;    // Signaled when cube task added
     
     // Statistics
     int64_t      total_tasks_scheduled;
@@ -154,10 +185,16 @@ typedef struct {
     
     // Worker threads
     pthread_t         workers[PTO_MAX_WORKERS];
-    int32_t           num_workers;           // Number of worker threads
+    int32_t           num_workers;           // Total number of worker threads
+    int32_t           num_vector_workers;    // Number of vector workers (is_cube=0)
+    int32_t           num_cube_workers;      // Number of cube workers (is_cube=1)
     volatile bool     shutdown_requested;    // Signal workers to exit
     volatile bool     execution_started;     // Orchestration has submitted all tasks
     int32_t           execution_task_threshold;  // Start workers when task_count > threshold
+    
+    // Simulation mode (uses cycle_func instead of func_ptr)
+    bool              simulation_mode;       // If true, call cycle_func and record traces
+    bool              dual_queue_mode;       // If true, use separate cube/vector queues
     
     // InCore function registry (maps func_name to actual function pointer)
     // This is populated before execution starts
@@ -179,16 +216,101 @@ void pto_runtime_init(PTORuntime* rt);
 void pto_runtime_shutdown(PTORuntime* rt);
 
 /**
- * Allocate a new task ID and initialize task entry
+ * Enable simulation mode with cycle tracing
+ * In simulation mode:
+ * - Tasks call their cycle_func instead of func_ptr
+ * - Cycle counts are recorded to the global trace
+ * - Results can be visualized in Chrome Tracing
+ * 
+ * @param rt            Runtime context
+ * @param num_workers   Number of simulated worker threads for trace
+ */
+void pto_runtime_enable_simulation(PTORuntime* rt, int32_t num_workers);
+
+/**
+ * Enable simulation mode with separate cube and vector workers (a2a3_sim mode)
+ * 
+ * In a2a3_sim mode:
+ * - Creates num_vector_workers workers for is_cube=0 tasks (vector operations)
+ * - Creates num_cube_workers workers for is_cube=1 tasks (matmul operations)
+ * - Uses dual ready queues for separate scheduling
+ * 
+ * Typical configuration for A2/A3:
+ * - 48 vector workers
+ * - 24 cube workers
+ * 
+ * @param rt                 Runtime context
+ * @param num_vector_workers Number of vector workers (for is_cube=0 tasks)
+ * @param num_cube_workers   Number of cube workers (for is_cube=1 tasks)
+ */
+void pto_runtime_enable_a2a3_sim(PTORuntime* rt, int32_t num_vector_workers, int32_t num_cube_workers);
+
+/**
+ * Get next ready task for a vector worker (is_cube=0 tasks only)
+ * Returns task_id or -1 if no tasks ready
+ */
+int32_t pto_get_ready_task_vector(PTORuntime* rt);
+
+/**
+ * Get next ready task for a cube worker (is_cube=1 tasks only)
+ * Returns task_id or -1 if no tasks ready
+ */
+int32_t pto_get_ready_task_cube(PTORuntime* rt);
+
+/**
+ * Thread-safe get ready task for vector worker (blocking)
+ */
+int32_t pto_get_ready_task_vector_blocking(PTORuntime* rt);
+
+/**
+ * Thread-safe get ready task for cube worker (blocking)
+ */
+int32_t pto_get_ready_task_cube_blocking(PTORuntime* rt);
+
+/**
+ * Allocate a new task ID and initialize task entry (internal implementation)
  * @param rt            Runtime context
  * @param func_name     InCore function name
  * @param func_ptr      Function pointer (can be NULL)
  * @param buffer_bytes  Estimated tile buffer size in bytes (without reuse)
  * @param reuse_bytes   Estimated tile buffer size with reuse optimization
+ * @param is_cube       If true, task requires cube unit (scheduled on cube workers)
  * Returns task_id or -1 on failure
  */
-int32_t pto_task_alloc(PTORuntime* rt, const char* func_name, void* func_ptr,
-                       int32_t buffer_bytes, int32_t reuse_bytes);
+int32_t pto_task_alloc_impl(PTORuntime* rt, const char* func_name, void* func_ptr,
+                            int32_t buffer_bytes, int32_t reuse_bytes, bool is_cube);
+
+/**
+ * Backward compatible task alloc - accepts 5 or 6 arguments
+ * If is_cube is not provided, defaults to false (vector worker)
+ */
+static inline int32_t pto_task_alloc_5(PTORuntime* rt, const char* func_name, 
+                                       void* func_ptr, int32_t buffer_bytes, 
+                                       int32_t reuse_bytes) {
+    return pto_task_alloc_impl(rt, func_name, func_ptr, buffer_bytes, reuse_bytes, false);
+}
+
+static inline int32_t pto_task_alloc_6(PTORuntime* rt, const char* func_name, 
+                                       void* func_ptr, int32_t buffer_bytes, 
+                                       int32_t reuse_bytes, bool is_cube) {
+    return pto_task_alloc_impl(rt, func_name, func_ptr, buffer_bytes, reuse_bytes, is_cube);
+}
+
+/**
+ * Macro to select correct overload based on argument count
+ */
+#define _PTO_TASK_ALLOC_NARG(...) _PTO_TASK_ALLOC_NARG_(__VA_ARGS__, 6, 5, 4, 3, 2, 1, 0)
+#define _PTO_TASK_ALLOC_NARG_(_1, _2, _3, _4, _5, _6, N, ...) N
+
+#define _PTO_TASK_ALLOC_DISPATCH(N) _PTO_TASK_ALLOC_DISPATCH_(N)
+#define _PTO_TASK_ALLOC_DISPATCH_(N) pto_task_alloc_##N
+
+#define pto_task_alloc(...) _PTO_TASK_ALLOC_DISPATCH(_PTO_TASK_ALLOC_NARG(__VA_ARGS__))(__VA_ARGS__)
+
+/**
+ * Set the cycle cost function for a task (for simulation mode)
+ */
+void pto_task_set_cycle_func(PTORuntime* rt, int32_t task_id, CycleCostFunc cycle_func);
 
 /**
  * Add an input argument to a task
@@ -228,6 +350,12 @@ int32_t pto_get_ready_task(PTORuntime* rt);
  * Execute all pending tasks until completion (single-threaded)
  */
 void pto_execute_all(PTORuntime* rt);
+
+/**
+ * Execute a single task with specified worker ID (for simulation mode)
+ * Records cycle trace when simulation mode is enabled
+ */
+void pto_execute_task_with_worker(PTORuntime* rt, int32_t task_id, int32_t worker_id);
 
 // =============================================================================
 // Multi-threaded Execution API
@@ -353,13 +481,16 @@ void pto_tensormap_clear(PTORuntime* rt);
 typedef struct RecordedTask {
     const char*  func_name;                    // InCore function name
     void*        func_ptr;                     // Function pointer
+    CycleCostFunc cycle_func;                  // Cycle cost function (for simulation)
     int32_t      buffer_size_bytes;            // Buffer size estimation
     int32_t      buffer_size_with_reuse;       // Buffer size with reuse
     int32_t      fanin;                        // Initial fanin count (immutable)
+    int32_t      internal_fanin;               // Fanin from within same fragment (for replay)
     int32_t      fanout[PTO_MAX_FANOUT];       // Relative fanout offsets
     int32_t      fanout_count;                 // Number of fanouts
     TaskArg      args[PTO_MAX_ARGS];           // Arguments (with template regions)
     int32_t      num_args;                     // Number of arguments
+    bool         is_cube;                      // True if requires cube unit (matmul)
 } RecordedTask;
 
 /**
@@ -466,5 +597,80 @@ void pto_fragment_free(RecordedFragment* fragment);
  * Get fragment size in bytes
  */
 size_t pto_fragment_size(RecordedFragment* fragment);
+
+// =============================================================================
+// Cycle Trace Recording for Performance Analysis
+// =============================================================================
+
+#define PTO_MAX_TRACE_ENTRIES 524288  // 512K for large task graphs
+#define PTO_MAX_FUNC_NAME_LEN 64
+
+/**
+ * Single trace entry recording one task execution
+ */
+typedef struct {
+    char func_name[PTO_MAX_FUNC_NAME_LEN];
+    int32_t worker_id;
+    int64_t start_cycle;
+    int64_t end_cycle;
+} CycleTraceEntry;
+
+/**
+ * Cycle trace buffer for recording task execution timing
+ */
+typedef struct {
+    CycleTraceEntry entries[PTO_MAX_TRACE_ENTRIES];
+    int32_t count;
+    int32_t num_workers;
+    int64_t per_worker_cycle[PTO_MAX_WORKERS];  // Current cycle per worker
+    bool enabled;
+} CycleTrace;
+
+/**
+ * Global cycle trace (for single-trace use case)
+ */
+extern CycleTrace* pto_global_trace;
+
+/**
+ * Initialize cycle tracing
+ */
+void pto_trace_init(int32_t num_workers);
+
+/**
+ * Record a task execution (simple version - no dependency tracking)
+ */
+void pto_trace_record(int32_t worker_id, const char* func_name, int64_t cycle_cost);
+
+/**
+ * Record a task execution with explicit timing (dependency-aware)
+ */
+void pto_trace_record_with_time(int32_t worker_id, const char* func_name, 
+                                 int64_t start_cycle, int64_t end_cycle);
+
+/**
+ * Get the current cycle for a worker
+ */
+int64_t pto_trace_get_cycle(int32_t worker_id);
+
+/**
+ * Cleanup trace resources
+ */
+void pto_trace_cleanup(void);
+
+/**
+ * Generate Chrome Tracing JSON format (for chrome://tracing visualization)
+ * Returns newly allocated string that caller must free
+ */
+char* pto_trace_to_chrome_json(void);
+
+/**
+ * Write trace to file in Chrome Tracing JSON format
+ */
+void pto_trace_write_json(const char* filename);
+
+/**
+ * Print trace summary statistics
+ */
+void pto_trace_print_summary(void);
 
 #endif // PTO_RUNTIME_H

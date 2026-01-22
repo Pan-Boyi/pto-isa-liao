@@ -169,6 +169,7 @@ class PTOProgram:
     instructions: List[PTOInstruction] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
     is_in_core: bool = True  # Default: function runs within a single core
+    is_cube: bool = False  # If True, this InCore function requires cube unit (matmul)
     imports: List[str] = field(default_factory=list)  # Imported function names
     
     def add_tile(self, name: str, rows: int, cols: int, dtype: ElementType = ElementType.F32):
@@ -423,6 +424,23 @@ class PTOFunctionBuilder:
         - Cannot contain tile operations (will raise validation error)
         """
         self.program.is_in_core = False
+        return self
+    
+    def cube(self, is_cube: bool = True) -> "PTOFunctionBuilder":
+        """
+        Mark this InCore function as requiring cube unit execution.
+        
+        This is a hint for the a2a3_sim backend to schedule this task
+        on cube workers instead of vector workers.
+        
+        In a2a3_sim runtime:
+        - 48 vector workers execute is_cube=False tasks
+        - 24 cube workers execute is_cube=True tasks
+        
+        Args:
+            is_cube: If True (default), this function requires cube unit
+        """
+        self.program.is_cube = is_cube
         return self
     
     def import_func(self, func_name: str) -> "PTOFunctionBuilder":
@@ -2515,6 +2533,13 @@ BACKENDS = {
         "header_func": lambda: "// Auto-generated Ascend A5 code from PTO ISA Compiler\n",
         "type_map": {},  # C++ header-based; not type-mapped like C/CUDA
     },
+    "ascend_a2a3_sim": {
+        "name": "Huawei Ascend A2/A3 Cycle Simulator",
+        "suffix": "_ascend_a2a3_sim",
+        "extension": ".c",
+        "header_func": lambda: "// Auto-generated Ascend A2/A3 Cycle Simulator from PTO ISA Compiler\n",
+        "type_map": ARM64_TYPE_MAP,  # Runs on ARM64 host
+    },
     # NOTE: The older Ascend-C (AscendC) backend remains available via code, but is not
     # exposed as a default backend key here because this repo is switching naming to A2/A3 and A5.
 }
@@ -3460,8 +3485,15 @@ def _gen_task_scheduling_code(callee: str, args: Union[List, Dict], orch_ctx: Or
     buf_bytes = int(buf_without_reuse * 1024)  # Convert KB to bytes
     reuse_bytes = int(buf_with_reuse * 1024)
     
+    # Get is_cube from callee function if available
+    callee_is_cube = 0  # default: vector worker
+    if orch_ctx.module:
+        callee_prog = orch_ctx.module.functions.get(callee)
+        if callee_prog and getattr(callee_prog, 'is_cube', False):
+            callee_is_cube = 1
+    
     lines.append(f"// Task {task_id}: {callee}")
-    lines.append(f"int32_t t{task_id} = pto_task_alloc(rt, \"{callee}\", NULL, {buf_bytes}, {reuse_bytes});")
+    lines.append(f"int32_t t{task_id} = pto_task_alloc(rt, \"{callee}\", NULL, {buf_bytes}, {reuse_bytes}, {callee_is_cube});")
     
     # Parse arguments: determine inputs vs outputs
     input_args = []
@@ -4740,6 +4772,22 @@ class MultiBackendCodeGenerator:
         """Generate Huawei Ascend A2/A3 code using the copied `include/pto` header backend."""
         return self._generate_pto_header_npu(program, soc="a2a3")
 
+    def generate_ascend_a2a3_sim(self, program) -> str:
+        """
+        Generate Ascend A2/A3 cycle simulation code that runs on ARM64.
+        
+        This backend generates C code that:
+        - Executes scalar operations normally
+        - Simulates vector/tile operations by incrementing a cycle counter
+        - Returns the total cycle count
+        
+        The function signature becomes:
+            int64_t <func_name>(void** args, int32_t num_args)
+        
+        This is used for performance modeling without actual NPU hardware.
+        """
+        return self._generate_cycle_sim(program)
+
     def generate_ascend_a5(self, program) -> str:
         """Generate Huawei Ascend A5 code using the copied `include/pto` header backend."""
         return self._generate_pto_header_npu(program, soc="a5")
@@ -5359,6 +5407,315 @@ class MultiBackendCodeGenerator:
         lines.append("#endif  // PTO_NPU_SMOKE_RUNNER")
 
         return "\n".join(lines)
+
+    def _generate_cycle_sim(self, program) -> str:
+        """
+        Generate Ascend A2/A3 cycle simulation code that runs on ARM64.
+        
+        Generates C code where:
+        - Scalar operations execute normally on the host CPU
+        - Vector/tile operations increment a cycle counter by their estimated cost
+        - Function returns total cycle count for performance modeling
+        
+        Cycle cost model (simplified):
+        - TLOAD/TSTORE: cost based on tile size
+        - Vector ops (TADD, TMUL, etc.): 1 cycle per operation
+        - TMATMUL: cost based on matrix dimensions
+        - Row/Col reductions: 1 cycle per row
+        """
+        is_in_core = getattr(program, 'is_in_core', True)
+        if not is_in_core:
+            return "\n".join([
+                f"// PTO Program: {program.name}",
+                "// Backend: Ascend A2/A3 Cycle Simulator",
+                "// ERROR: Orchestration functions are not supported for cycle simulation.",
+            ])
+
+        def _cpp_type_for_element_type(et: 'ElementType') -> str:
+            m = {
+                "f32": "float", "f16": "float", "bf16": "float",
+                "f64": "double",
+                "i8": "int8_t", "i16": "int16_t", "i32": "int32_t", "i64": "int64_t",
+                "u1": "uint8_t", "u8": "uint8_t", "u16": "uint16_t", "u32": "uint32_t", "u64": "uint64_t",
+                "index": "int32_t",
+            }
+            return m.get(et.value, "float")
+
+        def _bytes_per_element(et: 'ElementType') -> int:
+            m = {"u1": 1, "i8": 1, "u8": 1, "i16": 2, "u16": 2, "f16": 2, "bf16": 2,
+                 "i32": 4, "u32": 4, "f32": 4, "i64": 8, "u64": 8, "f64": 8}
+            return m.get(et.value, 4)
+
+        # Collect tile metadata for cycle cost estimation
+        tile_meta = {}
+        for tile_name, tile_type in program.tile_declarations.items():
+            tile_meta[tile_name] = (tile_type.shape.rows, tile_type.shape.cols, tile_type.element_type)
+
+        # Track memref shapes for load/store cost
+        memref_shape = {}
+        for instr in program.instructions:
+            op = getattr(instr, "opcode", "")
+            if op == "TLOAD":
+                tile_t = program.tile_declarations.get(instr.dst.name)
+                if tile_t:
+                    memref_shape.setdefault(instr.src_mem.name, (tile_t.shape.rows, tile_t.shape.cols))
+            elif op in ("TSTORE", "TSTORE_FP"):
+                tile_t = program.tile_declarations.get(instr.src.name)
+                if tile_t:
+                    memref_shape.setdefault(instr.dst_mem.name, (tile_t.shape.rows, tile_t.shape.cols))
+
+        # Build parameter lists
+        memref_params = []
+        for name, memref_type in program.memref_declarations.items():
+            c_type = _cpp_type_for_element_type(memref_type.element_type)
+            memref_params.append(f"{c_type}* {name}")
+
+        scalar_params = []
+        for name, scalar_type in program.scalar_declarations.items():
+            if scalar_type in (ElementType.U1, ElementType.INDEX):
+                continue
+            c_type = _cpp_type_for_element_type(scalar_type)
+            scalar_params.append(f"{c_type} {name}")
+
+        # Get is_cube flag (default False for backward compat)
+        is_cube = getattr(program, 'is_cube', False)
+        is_cube_val = 1 if is_cube else 0
+
+        # Header
+        lines = [
+            f"// PTO Program: {program.name}",
+            "// Backend: Ascend A2/A3 Cycle Simulator (runs on ARM64)",
+            "// This code simulates NPU execution for cycle estimation",
+            f"// is_cube: {is_cube_val} (0=vector worker, 1=cube worker)",
+            "",
+            "#include <stdint.h>",
+            "#include <stdlib.h>",
+            "#include <string.h>",
+            "#include <math.h>",
+            "",
+            "// Cycle cost constants (simplified model)",
+            "#ifndef CYCLE_TLOAD_PER_ELEMENT",
+            "#define CYCLE_TLOAD_PER_ELEMENT  0.0625f  // 1 cycle per 16 elements (512-bit bus)",
+            "#define CYCLE_TSTORE_PER_ELEMENT 0.0625f",
+            "#define CYCLE_VECTOR_OP          1        // Most vector ops = 1 cycle",
+            "#define CYCLE_REDUCTION_PER_ROW  1        // Row reductions",
+            "#define CYCLE_MATMUL_PER_MAC     0.001f   // Cube unit: ~1000 MACs per cycle",
+            "#endif",
+            "",
+            f"// Worker type flag: 0 = vector worker, 1 = cube worker",
+            f"static const int {program.name}_is_cube = {is_cube_val};",
+            "",
+        ]
+
+        # Declare tiles as local arrays for scalar simulation (with function prefix to avoid conflicts)
+        lines.append("// Tile buffers (for scalar simulation)")
+        for tile_name, (rows, cols, et) in tile_meta.items():
+            c_type = _cpp_type_for_element_type(et)
+            size = rows * cols
+            lines.append(f"static {c_type} _tile_{program.name}_{tile_name}[{size}];")
+        lines.append("")
+
+        # Main function signature (returns cycle count)
+        all_params = memref_params + scalar_params
+        if all_params:
+            params_str = ", ".join(all_params)
+        else:
+            params_str = "void"
+        
+        lines.append(f"int64_t {program.name}_sim({params_str}) {{")
+        lines.append("    int64_t _cycle_count = 0;")
+        lines.append("")
+
+        # Local scalars
+        for sname, stype in program.scalar_declarations.items():
+            if stype in (ElementType.U1, ElementType.INDEX):
+                c_type = _cpp_type_for_element_type(stype)
+                lines.append(f"    {c_type} {sname} = 0;")
+        lines.append("")
+
+        # Generate code for each instruction
+        indent_level = 1
+        def _indent():
+            return "    " * indent_level
+
+        for idx, instr in enumerate(program.instructions):
+            op = getattr(instr, "opcode", "")
+            
+            # Control flow
+            if op == "FOR":
+                iv = instr.iv.name
+                lb = _get_operand_str(instr.lb)
+                ub = _get_operand_str(instr.ub)
+                step = _get_operand_str(instr.step)
+                lines.append(f"{_indent()}for (int32_t {iv} = ({lb}); {iv} < ({ub}); {iv} += ({step})) {{")
+                indent_level += 1
+                continue
+            if op == "ENDFOR":
+                indent_level = max(1, indent_level - 1)
+                lines.append(f"{_indent()}}}")
+                continue
+            if op == "IF":
+                cond = _get_operand_str(instr.cond)
+                bit_test = getattr(instr, "bit_test", None)
+                if bit_test is not None:
+                    cond_expr = f"(({cond}) & ({bit_test})) != 0"
+                else:
+                    cond_expr = f"({cond})"
+                lines.append(f"{_indent()}if ({cond_expr}) {{")
+                indent_level += 1
+                continue
+            if op == "ELSE":
+                indent_level = max(1, indent_level - 1)
+                lines.append(f"{_indent()}}} else {{")
+                indent_level += 1
+                continue
+            if op == "ENDIF":
+                indent_level = max(1, indent_level - 1)
+                lines.append(f"{_indent()}}}")
+                continue
+            if op in ("BREAK", "CONTINUE"):
+                lines.append(f"{_indent()}{op.lower()};")
+                continue
+
+            # Scalar ops (execute normally)
+            if op == "LI":
+                dst = instr.dst.name
+                imm = _get_operand_str(instr.imm)
+                lines.append(f"{_indent()}{dst} = {imm};")
+            elif op == "MOV":
+                dst = instr.dst.name
+                src = _get_operand_str(instr.src)
+                lines.append(f"{_indent()}{dst} = {src};")
+            elif op in ("ADD", "SUB", "MUL", "DIV"):
+                dst = instr.dst.name
+                src0 = _get_operand_str(instr.src0)
+                src1 = _get_operand_str(instr.src1)
+                op_map = {"ADD": "+", "SUB": "-", "MUL": "*", "DIV": "/"}
+                lines.append(f"{_indent()}{dst} = ({src0}) {op_map[op]} ({src1});")
+            elif op == "CMP":
+                dst = instr.dst.name
+                src0 = _get_operand_str(instr.src0)
+                src1 = _get_operand_str(instr.src1)
+                mode = getattr(instr.cmp_mode, "value", str(instr.cmp_mode))
+                cmp_map = {"EQ": "==", "NE": "!=", "LT": "<", "LE": "<=", "GT": ">", "GE": ">="}
+                cmp_op = cmp_map.get(mode, "!=")
+                lines.append(f"{_indent()}{dst} = (({src0}) {cmp_op} ({src1})) ? 1 : 0;")
+
+            # Tile ops (increment cycle count, don't execute)
+            elif op == "TLOAD":
+                dst = instr.dst.name
+                tile_t = tile_meta.get(dst, (32, 128, ElementType.F32))
+                rows, cols = tile_t[0], tile_t[1]
+                size = rows * cols
+                lines.append(f"{_indent()}_cycle_count += (int64_t)({size} * CYCLE_TLOAD_PER_ELEMENT);  // TLOAD {dst}")
+            elif op in ("TSTORE", "TSTORE_FP"):
+                src = instr.src.name
+                tile_t = tile_meta.get(src, (32, 128, ElementType.F32))
+                rows, cols = tile_t[0], tile_t[1]
+                size = rows * cols
+                lines.append(f"{_indent()}_cycle_count += (int64_t)({size} * CYCLE_TSTORE_PER_ELEMENT);  // TSTORE {src}")
+
+            # Binary vector ops
+            elif op in ("TADD", "TSUB", "TMUL", "TDIV", "TMAX", "TMIN", "TAND", "TOR", "TXOR"):
+                dst = instr.dst.name
+                lines.append(f"{_indent()}_cycle_count += CYCLE_VECTOR_OP;  // {op} {dst}")
+            
+            # Unary vector ops
+            elif op in ("TABS", "TNEG", "TNOT", "TEXP", "TLOG", "TSQRT", "TRSQRT", "TRECIP", "TRELU"):
+                dst = instr.dst.name
+                lines.append(f"{_indent()}_cycle_count += CYCLE_VECTOR_OP;  // {op} {dst}")
+            
+            # Scalar-tile ops
+            elif op in ("TADDS", "TSUBS", "TMULS", "TDIVS", "TMAXS", "TMINS", "TEXPANDS"):
+                dst = instr.dst.name
+                lines.append(f"{_indent()}_cycle_count += CYCLE_VECTOR_OP;  // {op} {dst}")
+            
+            # Reductions
+            elif op in ("TROWSUM", "TROWMAX", "TROWMIN"):
+                dst = instr.dst.name
+                src = instr.src.name
+                tile_t = tile_meta.get(src, (32, 128, ElementType.F32))
+                rows = tile_t[0]
+                lines.append(f"{_indent()}_cycle_count += {rows} * CYCLE_REDUCTION_PER_ROW;  // {op} {src}")
+            elif op in ("TCOLSUM", "TCOLMAX", "TCOLMIN"):
+                dst = instr.dst.name
+                src = instr.src.name
+                tile_t = tile_meta.get(src, (32, 128, ElementType.F32))
+                cols = tile_t[1]
+                lines.append(f"{_indent()}_cycle_count += {cols} * CYCLE_REDUCTION_PER_ROW;  // {op} {src}")
+            
+            # Row/Col expand ops
+            elif op.startswith("TROWEXPAND") or op.startswith("TCOLEXPAND"):
+                dst = instr.dst.name
+                lines.append(f"{_indent()}_cycle_count += CYCLE_VECTOR_OP;  // {op} {dst}")
+            
+            # Matrix multiply (high cost)
+            elif op.startswith("TMATMUL"):
+                dst = getattr(instr, "dst", None)
+                dst_name = dst.name if dst else "result"
+                # Estimate based on typical matmul dimensions
+                tile_t = tile_meta.get(dst_name, (32, 128, ElementType.F32))
+                rows, cols = tile_t[0], tile_t[1]
+                # Assume K dimension matches cols for simplicity
+                macs = rows * cols * cols
+                lines.append(f"{_indent()}_cycle_count += (int64_t)({macs} * CYCLE_MATMUL_PER_MAC);  // {op}")
+            
+            # Other ops
+            elif op in ("TRESHAPE", "TTRANS", "TEXTRACT", "TCVT", "TSEL", "TCMP", "TCMPS"):
+                dst = getattr(instr, "dst", None)
+                dst_name = dst.name if dst else "?"
+                lines.append(f"{_indent()}_cycle_count += CYCLE_VECTOR_OP;  // {op} {dst_name}")
+            
+            else:
+                # Unknown op - minimal cost
+                lines.append(f"{_indent()}// {op} (no cycle cost)")
+
+        lines.append("")
+        lines.append("    return _cycle_count;")
+        lines.append("}")
+        lines.append("")
+
+        # Also generate a PTO runtime compatible wrapper
+        lines.append("// PTO Runtime compatible wrapper")
+        lines.append(f"void {program.name}(void** args, int32_t num_args) {{")
+        lines.append("    (void)args; (void)num_args;")
+        lines.append("    // This wrapper is for compatibility; use _sim version for cycle count")
+        lines.append("}")
+        lines.append("")
+
+        # Generate function to get cycle count from runtime args
+        lines.append("// Get cycle count from runtime arguments")
+        arg_idx = 0
+        cast_lines = []
+        call_args = []
+        for name, memref_type in program.memref_declarations.items():
+            c_type = _cpp_type_for_element_type(memref_type.element_type)
+            cast_lines.append(f"    {c_type}* {name} = ({c_type}*)args[{arg_idx}];")
+            call_args.append(name)
+            arg_idx += 1
+        for name, scalar_type in program.scalar_declarations.items():
+            if scalar_type not in (ElementType.U1, ElementType.INDEX):
+                c_type = _cpp_type_for_element_type(scalar_type)
+                cast_lines.append(f"    {c_type} {name} = *({c_type}*)args[{arg_idx}];")
+                call_args.append(name)
+                arg_idx += 1
+
+        lines.append(f"int64_t {program.name}_cycle_count(void** args, int32_t num_args) {{")
+        lines.append("    (void)num_args;")
+        for cl in cast_lines:
+            lines.append(cl)
+        call_args_str = ", ".join(call_args) if call_args else ""
+        lines.append(f"    return {program.name}_sim({call_args_str});")
+        lines.append("}")
+        lines.append("")
+        
+        # Generate function to get is_cube flag
+        lines.append("// Get is_cube flag for this function")
+        lines.append(f"int {program.name}_get_is_cube(void) {{")
+        lines.append(f"    return {program.name}_is_cube;")
+        lines.append("}")
+
+        return "\n".join(lines)
     
     def generate_all(self, program, output_prefix: str, output_base_dir: str = ".") -> Dict[str, str]:
         """
@@ -5393,6 +5750,7 @@ class MultiBackendCodeGenerator:
             "cuda": self.generate_cuda,
             "ascend_a2a3": self.generate_ascend_a2a3,
             "ascend_a5": self.generate_ascend_a5,
+            "ascend_a2a3_sim": self.generate_ascend_a2a3_sim,
         }
         
         # Determine which backends to generate
@@ -5720,11 +6078,16 @@ class RuntimeCodeGenerator:
         
         # Generate task scheduling for each InCore call
         for idx, call in enumerate(incore_calls):
+            # Get is_cube from callee function if available
+            callee_prog = self.module.functions.get(call.callee)
+            callee_is_cube = 0  # default: vector worker
+            if callee_prog and getattr(callee_prog, 'is_cube', False):
+                callee_is_cube = 1
+            
             self._emit(f"// Task {idx}: {call.callee}")
-            self._emit(f"int32_t t{idx} = pto_task_alloc(rt, \"{call.callee}\", (void*){call.callee});")
+            self._emit(f"int32_t t{idx} = pto_task_alloc(rt, \"{call.callee}\", (void*){call.callee}, 0, 0, {callee_is_cube});")
             
             # Determine inputs and outputs from the called function
-            callee_prog = self.module.functions.get(call.callee)
             if callee_prog:
                 # Analyze memref declarations to determine inputs/outputs
                 arg_mapping = call.args  # param_name -> actual_arg_name
@@ -5923,11 +6286,16 @@ class OrchestrationCodeGenerator:
             self._emit(f"// ERROR: Unknown function {call.callee}")
             return
         
+        # Get is_cube from callee function
+        callee_is_cube = 0  # default: vector worker
+        if getattr(callee, 'is_cube', False):
+            callee_is_cube = 1
+        
         task_id = self.task_counter
         self.task_counter += 1
         
         self._emit(f"// Task {task_id}: {call.callee}")
-        self._emit(f"int32_t t{task_id} = pto_task_alloc(rt, \"{call.callee}\", NULL);")
+        self._emit(f"int32_t t{task_id} = pto_task_alloc(rt, \"{call.callee}\", NULL, 0, 0, {callee_is_cube});")
         
         # Analyze arguments - determine inputs and outputs
         for param_name, arg_name in call.args.items():
@@ -6281,8 +6649,8 @@ Examples:
     )
     codegen_parser.add_argument(
         '--backend', default='ascend_a2a3',
-        choices=['arm64', 'cuda', 'ascend_a2a3', 'ascend_a5', 'all'],
-        help='Backend to generate (default: ascend_a2a3)'
+        choices=['arm64', 'cuda', 'ascend_a2a3', 'ascend_a5', 'ascend_a2a3_sim', 'all'],
+        help='Backend to generate (default: ascend_a2a3). Use ascend_a2a3_sim for cycle simulation.'
     )
     codegen_parser.add_argument(
         '--output-prefix', default='generated',
@@ -6358,6 +6726,8 @@ Examples:
                 code = gen.generate_ascend_a2a3(prog)
             elif backend_key == 'ascend_a5':
                 code = gen.generate_ascend_a5(prog)
+            elif backend_key == 'ascend_a2a3_sim':
+                code = gen.generate_ascend_a2a3_sim(prog)
             else:
                 raise ValueError(f"Unsupported backend: {backend_key}")
             out_file = os.path.join(out_dir, f"{prog.name}{backend_info['extension']}")
@@ -6386,7 +6756,7 @@ Examples:
                     print(f"Error: module function not found: {name}")
                     return 1
                 if args.backend == 'all':
-                    for bk in ('arm64', 'cuda', 'ascend_a2a3', 'ascend_a5'):
+                    for bk in ('arm64', 'cuda', 'ascend_a2a3', 'ascend_a5', 'ascend_a2a3_sim'):
                         _emit_one(prog, bk)
                     _emit_pto(prog)
                 else:
@@ -6395,7 +6765,7 @@ Examples:
         else:
             prog = obj
             if args.backend == 'all':
-                for bk in ('arm64', 'cuda', 'ascend_a2a3', 'ascend_a5'):
+                for bk in ('arm64', 'cuda', 'ascend_a2a3', 'ascend_a5', 'ascend_a2a3_sim'):
                     _emit_one(prog, bk)
                 _emit_pto(prog)
             else:
