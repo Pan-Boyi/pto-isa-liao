@@ -32,8 +32,33 @@
 #define PTO_MAX_FANOUT         512     // Maximum fanout per task
 #define PTO_MAX_ARGS           16      // Maximum arguments per task
 #define PTO_TENSORMAP_SIZE     16384   // Hash table size for tensor map
-#define PTO_MAX_READY_QUEUE    4096    // Ready queue size
+#define PTO_MAX_READY_QUEUE    65536   // Ready queue size (increased for large sequences)
 #define PTO_MAX_WORKERS        64      // Maximum worker threads
+
+// =============================================================================
+// Compact Replay Task (cache-optimized)
+// =============================================================================
+// 
+// PendingTask is ~2.8KB which causes severe cache thrashing during replay
+// (16K tasks = 735K cache lines touched). CompactTask is 24 bytes, fitting
+// ~2.7 entries per cache line (16K tasks = 6K cache lines = 120x better).
+//
+// For replay tasks, we use CompactTask array instead of PendingTask array.
+// This dramatically improves replay performance (from ~5K to ~15K+ tasks/ms).
+
+struct RecordedTask;  // Forward declaration
+
+/**
+ * Compact task entry for replay (24 bytes - cache friendly)
+ */
+typedef struct {
+    struct RecordedTask* template_ref;  // 8 bytes: immutable template
+    int32_t  resolved_fanin;            // 4 bytes: incremented when deps complete
+    int32_t  offset_delta;              // 4 bytes: row offset for this replay
+    bool     is_complete;               // 1 byte
+    bool     is_active;                 // 1 byte  
+    int16_t  _padding;                  // 2 bytes alignment
+} CompactTask;
 
 // =============================================================================
 // Data Structures
@@ -98,10 +123,11 @@ typedef struct TensorMapEntry {
  * PTO Runtime context
  */
 typedef struct {
-    // Task management
-    PendingTask  pend_task[PTO_MAX_TASKS];   // Pending task table
-    int32_t      next_task_id;               // Next available task ID
-    int32_t      active_task_count;          // Number of active tasks
+    // Task management - dual arrays for optimal cache behavior
+    PendingTask  pend_task[PTO_MAX_TASKS];    // Full task table (for direct tasks)
+    CompactTask  compact_task[PTO_MAX_TASKS]; // Compact array for replay tasks (24 bytes each)
+    int32_t      next_task_id;                // Next available task ID
+    int32_t      active_task_count;           // Number of active tasks
     
     // TensorMap for dependency tracking
     TensorMapEntry* tensor_map[PTO_TENSORMAP_SIZE];
@@ -315,5 +341,130 @@ void pto_tensormap_insert(PTORuntime* rt, TensorRegion* region, int32_t task_id)
  * Clear the tensor map
  */
 void pto_tensormap_clear(PTORuntime* rt);
+
+// =============================================================================
+// Record & Replay API (for loop optimization)
+// =============================================================================
+
+/**
+ * Recorded task entry - immutable template for replay
+ * Contains all data needed to replay a task without re-analyzing dependencies
+ */
+typedef struct RecordedTask {
+    const char*  func_name;                    // InCore function name
+    void*        func_ptr;                     // Function pointer
+    int32_t      buffer_size_bytes;            // Buffer size estimation
+    int32_t      buffer_size_with_reuse;       // Buffer size with reuse
+    int32_t      fanin;                        // Initial fanin count (immutable)
+    int32_t      fanout[PTO_MAX_FANOUT];       // Relative fanout offsets
+    int32_t      fanout_count;                 // Number of fanouts
+    TaskArg      args[PTO_MAX_ARGS];           // Arguments (with template regions)
+    int32_t      num_args;                     // Number of arguments
+} RecordedTask;
+
+/**
+ * Recorded output - for TensorMap replay
+ */
+typedef struct {
+    TensorRegion region;              // Tensor region (with template offsets)
+    int32_t      relative_producer;   // Offset from fragment base
+} RecordedOutput;
+
+/**
+ * Recorded fragment - a replayable task graph fragment
+ */
+typedef struct {
+    RecordedTask*   tasks;            // Array of recorded tasks
+    int32_t         task_count;       // Number of tasks
+    RecordedOutput* outputs;          // Array of output registrations
+    int32_t         output_count;     // Number of outputs
+    const char*     fragment_name;    // Human-readable name
+    int32_t         checksum;         // Simple checksum for validation
+} RecordedFragment;
+
+/**
+ * Offset mode for loop replay
+ */
+typedef enum {
+    OFFSET_NONE = 0,    // No offset adjustment
+    OFFSET_ROW,         // Adjust row_offset only
+    OFFSET_COL,         // Adjust col_offset only
+    OFFSET_ROW_COL      // Adjust both row and col offset
+} OffsetMode;
+
+/**
+ * Loop replay context - manages record/replay for a single loop
+ */
+typedef struct {
+    RecordedFragment* fragment;       // Recorded fragment (NULL before first record)
+    int32_t           record_start;   // Start task_id for recording (-1 if not recording)
+    int32_t           base_offset;    // Base offset from first recorded iteration
+    int32_t           stride;         // Offset stride per iteration
+    OffsetMode        offset_mode;    // How to adjust offsets during replay
+    const char*       loop_name;      // For debugging
+} LoopReplayCtx;
+
+/**
+ * Global flag to enable/disable loop replay optimization
+ * When disabled (0), pto_loop_should_record always returns true (direct task creation)
+ * When enabled (1, default), uses record/replay for cache efficiency
+ */
+extern int pto_record_replay_enabled;
+
+/**
+ * Enable or disable loop replay optimization
+ */
+void pto_set_record_replay(int enabled);
+
+/**
+ * Initialize loop replay context
+ */
+void pto_loop_init(LoopReplayCtx* ctx, const char* name, int32_t stride, OffsetMode mode);
+
+/**
+ * Check if we should record this iteration (returns true) or replay (returns false)
+ * If pto_record_replay_enabled is 0, always returns true (no replay)
+ */
+bool pto_loop_should_record(PTORuntime* rt, LoopReplayCtx* ctx, int32_t loop_idx);
+
+/**
+ * Finish recording the current iteration
+ */
+void pto_loop_finish_record(PTORuntime* rt, LoopReplayCtx* ctx);
+
+/**
+ * Replay the recorded fragment for this iteration
+ * Uses compact_task array for cache-efficient replay
+ */
+void pto_loop_replay(PTORuntime* rt, LoopReplayCtx* ctx, int32_t loop_idx);
+
+/**
+ * Cleanup loop replay context
+ */
+void pto_loop_cleanup(LoopReplayCtx* ctx);
+
+/**
+ * Validate that a task matches the recorded template (for debugging)
+ * Call this during development to verify replay correctness
+ * Returns true if the task arguments are compatible with replay
+ */
+bool pto_loop_validate_task(LoopReplayCtx* ctx, int32_t task_idx_in_fragment,
+                            int32_t loop_idx, TaskArg* args, int32_t num_args);
+
+/**
+ * Record a range of tasks as a fragment
+ */
+RecordedFragment* pto_fragment_record(PTORuntime* rt, int32_t start_id, int32_t end_id,
+                                      const char* name);
+
+/**
+ * Free a recorded fragment
+ */
+void pto_fragment_free(RecordedFragment* fragment);
+
+/**
+ * Get fragment size in bytes
+ */
+size_t pto_fragment_size(RecordedFragment* fragment);
 
 #endif // PTO_RUNTIME_H

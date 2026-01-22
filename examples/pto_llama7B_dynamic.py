@@ -131,26 +131,37 @@ TILE_INFO = get_tile_info(DTYPE, TARGET_ISA)
 # - 32K sequence: 1024 tiles → 512 iterations (50% reduction)
 # - 128K sequence: 4096 tiles → 2048 iterations (50% reduction)
 #
-# Only the residual loop (< min_range=256) uses 32-row tiles for fine-grained handling.
+# Tile size by binary expansion level
+# IMPORTANT: Larger blocks use larger tiles to reduce task count!
+# This is critical for keeping total task numbers manageable for long sequences.
+#
+# Example for 128K sequence (4096 base-32 tiles):
+#   - 4096 block with 256-row tiles: only 512 iterations (4096 / 8)
+#   - vs 4096 block with 64-row tiles: 2048 iterations (4x more tasks!)
+#
 # Key 0 is a special marker for residual iterations (< min_range)
 TILE_ROWS_BY_LEVEL = {
-    4096: 64,   # 128K seq: 4096 → 2048 iterations
-    2048: 64,   # 64K seq: 2048 → 1024 iterations
-    1024: 64,   # 32K seq: 1024 → 512 iterations  ← NOW USES 64-ROW!
-    512:  64,   # 16K seq: 512 → 256 iterations   ← NOW USES 64-ROW!
-    256:  64,   # 8K seq: 256 → 128 iterations    ← NOW USES 64-ROW!
-    0:    32,   # Residual (< min_range): smaller tiles for fine-grained handling
+    4096: 256,  # 128K seq: 4096 base tiles → 512 iterations (256/32 = 8x scale)
+    2048: 128,  # 64K seq: 2048 base tiles → 512 iterations (128/32 = 4x scale)
+    1024: 64,   # 32K seq: 1024 base tiles → 512 iterations (64/32 = 2x scale)
+    512:  64,   # 16K seq: 512 base tiles → 256 iterations
+    256:  64,   # 8K seq: 256 base tiles → 128 iterations (keep 64 to avoid task increase)
+    0:    32,   # Residual (< min_range): base tile size
 }
 TILE_ROWS_RESIDUAL = TILE_ROWS_BY_LEVEL[0]  # Alias for clarity
 
 # All tile variants we need to generate InCore functions for
-# Include both TILE_ROWS_BY_LEVEL values (64) and TILE_ROWS_RESIDUAL (32)
-TILE_SIZE_VARIANTS = sorted(set(TILE_ROWS_BY_LEVEL.values()) | {TILE_ROWS_RESIDUAL}, reverse=True)  # [64, 32]
+# Computed from TILE_ROWS_BY_LEVEL values: [256, 128, 64, 32]
+# Each variant creates InCore functions with corresponding row sizes
+TILE_SIZE_VARIANTS = sorted(set(TILE_ROWS_BY_LEVEL.values()) | {TILE_ROWS_RESIDUAL}, reverse=True)
 
 # Maximum number of tiles for binary-expanded loops
-# Use smallest quantized tile size for counting (exclude key 0 which is residual)
-MIN_TILE_ROWS = min(v for k, v in TILE_ROWS_BY_LEVEL.items() if k > 0)
-MAX_NUM_TILES = MAX_SEQ_LEN // MIN_TILE_ROWS  # 131072 / 32 = 4096
+# Count in BASE TILE units (32 rows), not the larger quantized tiles
+# This ensures the 4096 block (with 256-row tiles) is used for 128K sequences
+MAX_NUM_TILES = MAX_SEQ_LEN // TILE_ROWS  # 131072 / 32 = 4096 base tiles
+
+# For backwards compatibility (some places use this)
+MIN_TILE_ROWS = TILE_ROWS  # Base tile size for counting
 
 # Minimum block size for binary expansion (256 tiles = 8K sequence elements with 32-row tiles)
 # Residual iterations below this threshold handled by single loop

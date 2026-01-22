@@ -28,6 +28,11 @@ void pto_runtime_init(PTORuntime* rt) {
     
     // Initialize task table
     memset(rt->pend_task, 0, sizeof(rt->pend_task));
+    
+    // Initialize compact task array (for replay tasks)
+    // Setting template_ref to NULL marks entries as "not compact"
+    memset(rt->compact_task, 0, sizeof(rt->compact_task));
+    
     rt->next_task_id = 0;
     rt->active_task_count = 0;
     
@@ -441,23 +446,63 @@ void pto_task_complete(PTORuntime* rt, int32_t task_id) {
         return;
     }
     
-    PendingTask* task = &rt->pend_task[task_id];
-    task->is_complete = true;
+    // Check if this is a compact task (replay) or a regular task
+    CompactTask* ct = &rt->compact_task[task_id];
+    bool is_compact = (ct->template_ref != NULL);
+    
+    if (is_compact) {
+        ct->is_complete = true;
+    } else {
+        rt->pend_task[task_id].is_complete = true;
+    }
     rt->active_task_count--;
     rt->total_tasks_completed++;
     
-    DEBUG_PRINT("[PTO Runtime] Completed task %d: %s\n", task_id, task->func_name);
+    // Get fanout info from appropriate source
+    int32_t fanout_count;
+    int32_t* fanout;
+    const char* func_name;
+    
+    if (is_compact) {
+        fanout_count = ct->template_ref->fanout_count;
+        fanout = ct->template_ref->fanout;  // Relative offsets
+        func_name = ct->template_ref->func_name;
+    } else {
+        fanout_count = rt->pend_task[task_id].fanout_count;
+        fanout = rt->pend_task[task_id].fanout;  // Absolute IDs
+        func_name = rt->pend_task[task_id].func_name;
+    }
+    
+    DEBUG_PRINT("[PTO Runtime] Completed task %d: %s\n", task_id, func_name);
     
     // Update dependent tasks
-    for (int i = 0; i < task->fanout_count; i++) {
-        int32_t dep_id = task->fanout[i];
-        PendingTask* dep = &rt->pend_task[dep_id];
+    for (int i = 0; i < fanout_count; i++) {
+        // Compute dependent task ID
+        int32_t dep_id = is_compact ? (task_id + fanout[i]) : fanout[i];
         
-        dep->fanin--;
-        DEBUG_PRINT("[PTO Runtime] Task %d fanin decremented to %d\n", dep_id, dep->fanin);
+        // Check if dependent is compact or regular
+        CompactTask* dep_ct = &rt->compact_task[dep_id];
+        bool dep_is_compact = (dep_ct->template_ref != NULL);
         
-        // If all dependencies satisfied, add to ready queue
-        if (dep->fanin == 0 && !dep->is_complete) {
+        bool is_ready = false;
+        if (dep_is_compact) {
+            // Compact task: INCREMENT resolved_fanin, compare with template->fanin
+            dep_ct->resolved_fanin++;
+            is_ready = (dep_ct->resolved_fanin >= dep_ct->template_ref->fanin);
+            DEBUG_PRINT("[PTO Runtime] Task %d resolved_fanin=%d/%d\n", 
+                   dep_id, dep_ct->resolved_fanin, dep_ct->template_ref->fanin);
+        } else {
+            // Regular task: DECREMENT fanin
+            rt->pend_task[dep_id].fanin--;
+            is_ready = (rt->pend_task[dep_id].fanin == 0);
+            DEBUG_PRINT("[PTO Runtime] Task %d fanin decremented to %d\n", 
+                   dep_id, rt->pend_task[dep_id].fanin);
+        }
+        
+        // Check completion status
+        bool dep_complete = dep_is_compact ? dep_ct->is_complete : rt->pend_task[dep_id].is_complete;
+        
+        if (is_ready && !dep_complete) {
             ready_queue_push(rt, dep_id);
             DEBUG_PRINT("[PTO Runtime] Task %d is now ready\n", dep_id);
         }
@@ -472,13 +517,35 @@ void pto_task_complete_threadsafe(PTORuntime* rt, int32_t task_id) {
     
     pthread_mutex_lock(&rt->task_mutex);
     
-    PendingTask* task = &rt->pend_task[task_id];
-    task->is_complete = true;
+    // Check if this is a compact task (replay) or a regular task
+    CompactTask* ct = &rt->compact_task[task_id];
+    bool is_compact = (ct->template_ref != NULL);
+    
+    if (is_compact) {
+        ct->is_complete = true;
+    } else {
+        rt->pend_task[task_id].is_complete = true;
+    }
     rt->active_task_count--;
     rt->total_tasks_completed++;
     
+    // Get fanout info from appropriate source
+    int32_t fanout_count;
+    int32_t* fanout;
+    const char* func_name;
+    
+    if (is_compact) {
+        fanout_count = ct->template_ref->fanout_count;
+        fanout = ct->template_ref->fanout;  // Relative offsets
+        func_name = ct->template_ref->func_name;
+    } else {
+        fanout_count = rt->pend_task[task_id].fanout_count;
+        fanout = rt->pend_task[task_id].fanout;  // Absolute IDs
+        func_name = rt->pend_task[task_id].func_name;
+    }
+    
     DEBUG_PRINT("[PTO Runtime] Completed task %d: %s (completed=%lld/%lld)\n", 
-           task_id, task->func_name, 
+           task_id, func_name, 
            (long long)rt->total_tasks_completed, 
            (long long)rt->total_tasks_scheduled);
     
@@ -486,14 +553,32 @@ void pto_task_complete_threadsafe(PTORuntime* rt, int32_t task_id) {
     int32_t newly_ready[PTO_MAX_FANOUT];
     int32_t newly_ready_count = 0;
     
-    for (int i = 0; i < task->fanout_count; i++) {
-        int32_t dep_id = task->fanout[i];
-        PendingTask* dep = &rt->pend_task[dep_id];
+    for (int i = 0; i < fanout_count; i++) {
+        // Compute dependent task ID
+        int32_t dep_id = is_compact ? (task_id + fanout[i]) : fanout[i];
         
-        dep->fanin--;
-        DEBUG_PRINT("[PTO Runtime] Task %d fanin decremented to %d\n", dep_id, dep->fanin);
+        // Check if dependent is compact or regular
+        CompactTask* dep_ct = &rt->compact_task[dep_id];
+        bool dep_is_compact = (dep_ct->template_ref != NULL);
         
-        if (dep->fanin == 0 && !dep->is_complete) {
+        bool is_ready = false;
+        bool dep_complete = false;
+        
+        if (dep_is_compact) {
+            dep_ct->resolved_fanin++;
+            is_ready = (dep_ct->resolved_fanin >= dep_ct->template_ref->fanin);
+            dep_complete = dep_ct->is_complete;
+            DEBUG_PRINT("[PTO Runtime] Task %d resolved_fanin=%d/%d\n", 
+                   dep_id, dep_ct->resolved_fanin, dep_ct->template_ref->fanin);
+        } else {
+            rt->pend_task[dep_id].fanin--;
+            is_ready = (rt->pend_task[dep_id].fanin == 0);
+            dep_complete = rt->pend_task[dep_id].is_complete;
+            DEBUG_PRINT("[PTO Runtime] Task %d fanin decremented to %d\n", 
+                   dep_id, rt->pend_task[dep_id].fanin);
+        }
+        
+        if (is_ready && !dep_complete) {
             newly_ready[newly_ready_count++] = dep_id;
         }
     }
@@ -513,7 +598,7 @@ void pto_task_complete_threadsafe(PTORuntime* rt, int32_t task_id) {
     if (all_done) {
         pthread_mutex_lock(&rt->queue_mutex);
         pthread_cond_broadcast(&rt->all_done);
-        pthread_cond_broadcast(&rt->queue_not_empty);  // Wake up waiting workers
+        pthread_cond_broadcast(&rt->queue_not_empty);
         pthread_mutex_unlock(&rt->queue_mutex);
     }
 }
@@ -801,6 +886,356 @@ int pto_runtime_dump_stdout(PTORuntime* rt) {
 }
 
 // =============================================================================
+// Record & Replay Implementation (using compact_task for cache efficiency)
+// =============================================================================
+
+RecordedFragment* pto_fragment_record(PTORuntime* rt, int32_t start_id, int32_t end_id,
+                                       const char* name) {
+    if (!rt || start_id < 0 || end_id <= start_id || end_id > rt->next_task_id) {
+        fprintf(stderr, "[PTO Runtime] ERROR: Invalid fragment range [%d, %d)\n", start_id, end_id);
+        return NULL;
+    }
+    
+    int32_t task_count = end_id - start_id;
+    
+    // Allocate fragment structure
+    RecordedFragment* frag = (RecordedFragment*)malloc(sizeof(RecordedFragment));
+    if (!frag) return NULL;
+    
+    frag->tasks = (RecordedTask*)malloc(task_count * sizeof(RecordedTask));
+    if (!frag->tasks) {
+        free(frag);
+        return NULL;
+    }
+    
+    // Count outputs first
+    int32_t output_count = 0;
+    for (int32_t i = start_id; i < end_id; i++) {
+        PendingTask* task = &rt->pend_task[i];
+        for (int j = 0; j < task->num_args; j++) {
+            if (task->args[j].is_output) {
+                output_count++;
+            }
+        }
+    }
+    
+    frag->outputs = (RecordedOutput*)malloc(output_count * sizeof(RecordedOutput));
+    if (!frag->outputs && output_count > 0) {
+        free(frag->tasks);
+        free(frag);
+        return NULL;
+    }
+    
+    frag->task_count = task_count;
+    frag->output_count = 0;
+    frag->fragment_name = name;
+    frag->checksum = 0;
+    
+    // Record each task - convert absolute fanout to relative offsets
+    for (int32_t i = 0; i < task_count; i++) {
+        PendingTask* src = &rt->pend_task[start_id + i];
+        RecordedTask* dst = &frag->tasks[i];
+        
+        dst->func_name = src->func_name;
+        dst->func_ptr = src->func_ptr;
+        dst->buffer_size_bytes = src->buffer_size_bytes;
+        dst->buffer_size_with_reuse = src->buffer_size_with_reuse;
+        dst->fanin = src->fanin;
+        dst->num_args = src->num_args;
+        
+        // Convert fanout to relative offsets for position-independence
+        dst->fanout_count = src->fanout_count;
+        for (int j = 0; j < src->fanout_count; j++) {
+            dst->fanout[j] = src->fanout[j] - (start_id + i);  // relative offset
+        }
+        
+        // Copy arguments
+        memcpy(dst->args, src->args, src->num_args * sizeof(TaskArg));
+        
+        // Record outputs for TensorMap replay
+        for (int j = 0; j < src->num_args; j++) {
+            if (src->args[j].is_output) {
+                RecordedOutput* out = &frag->outputs[frag->output_count++];
+                out->region = src->args[j].region;
+                out->relative_producer = i;
+            }
+        }
+        
+        // Simple checksum
+        for (int j = 0; j < dst->fanout_count; j++) {
+            frag->checksum ^= dst->fanout[j] * (i + 1);
+        }
+    }
+    
+    DEBUG_PRINT("[PTO Runtime] Recorded fragment '%s': %d tasks, %d outputs\n",
+           name ? name : "(unnamed)", task_count, frag->output_count);
+    
+    return frag;
+}
+
+void pto_fragment_free(RecordedFragment* fragment) {
+    if (!fragment) return;
+    if (fragment->tasks) free(fragment->tasks);
+    if (fragment->outputs) free(fragment->outputs);
+    free(fragment);
+}
+
+size_t pto_fragment_size(RecordedFragment* fragment) {
+    if (!fragment) return 0;
+    size_t size = sizeof(RecordedFragment);
+    size += fragment->task_count * sizeof(RecordedTask);
+    size += fragment->output_count * sizeof(RecordedOutput);
+    return size;
+}
+
+// =============================================================================
+// Loop Replay Implementation (using compact_task for 120x cache improvement)
+// =============================================================================
+
+// =============================================================================
+// Global flag for record/replay optimization
+// =============================================================================
+
+int pto_record_replay_enabled = 1;  // Enabled by default
+
+void pto_set_record_replay(int enabled) {
+    pto_record_replay_enabled = enabled;
+    DEBUG_PRINT("[Loop Replay] Record/replay %s\n", enabled ? "ENABLED" : "DISABLED");
+}
+
+void pto_loop_init(LoopReplayCtx* ctx, const char* name, int32_t stride, OffsetMode mode) {
+    if (!ctx) return;
+    ctx->fragment = NULL;
+    ctx->record_start = -1;
+    ctx->base_offset = 0;
+    ctx->stride = stride;
+    ctx->offset_mode = mode;
+    ctx->loop_name = name;
+}
+
+bool pto_loop_should_record(PTORuntime* rt, LoopReplayCtx* ctx, int32_t loop_idx) {
+    if (!rt || !ctx) return true;
+    
+    // If replay is disabled, always return true (direct task creation)
+    if (!pto_record_replay_enabled) {
+        return true;
+    }
+    
+    if (ctx->fragment == NULL) {
+        // First iteration: need to record
+        ctx->record_start = rt->next_task_id;
+        ctx->base_offset = loop_idx * ctx->stride;
+        DEBUG_PRINT("[Loop Replay] Recording '%s' at iteration %d (base_offset=%d)\n",
+               ctx->loop_name ? ctx->loop_name : "?", loop_idx, ctx->base_offset);
+        return true;
+    }
+    
+    return false;  // Have fragment, can replay
+}
+
+void pto_loop_finish_record(PTORuntime* rt, LoopReplayCtx* ctx) {
+    if (!rt || !ctx || ctx->record_start < 0) return;
+    
+    // If replay is disabled, don't record (just reset state)
+    if (!pto_record_replay_enabled) {
+        ctx->record_start = -1;
+        return;
+    }
+    
+    int32_t end_id = rt->next_task_id;
+    ctx->fragment = pto_fragment_record(rt, ctx->record_start, end_id, ctx->loop_name);
+    
+    DEBUG_PRINT("[Loop Replay] Recorded '%s': %d tasks (IDs %d-%d)\n",
+           ctx->loop_name ? ctx->loop_name : "?",
+           ctx->fragment ? ctx->fragment->task_count : 0,
+           ctx->record_start, end_id - 1);
+    
+    ctx->record_start = -1;
+}
+
+void pto_loop_replay(PTORuntime* rt, LoopReplayCtx* ctx, int32_t loop_idx) {
+    if (!rt || !ctx || !ctx->fragment) return;
+    
+    RecordedFragment* frag = ctx->fragment;
+    int32_t offset_delta = (loop_idx * ctx->stride) - ctx->base_offset;
+    
+    if (rt->next_task_id + frag->task_count > PTO_MAX_TASKS) {
+        fprintf(stderr, "[Loop Replay] ERROR: Task table overflow\n");
+        return;
+    }
+    
+    int32_t base_id = rt->next_task_id;
+    
+    // =========================================================================
+    // CACHE-OPTIMIZED REPLAY: Use compact_task array (24 bytes per entry)
+    // This is 120x more cache-efficient than using pend_task (2.8KB per entry)
+    // =========================================================================
+    for (int32_t i = 0; i < frag->task_count; i++) {
+        RecordedTask* src = &frag->tasks[i];
+        int32_t task_id = base_id + i;
+        
+        // Write only to compact_task array (24 bytes, fits in one cache line)
+        CompactTask* ct = &rt->compact_task[task_id];
+        ct->template_ref = src;           // Point to immutable template
+        ct->resolved_fanin = 0;           // Incremented by producers
+        ct->offset_delta = offset_delta;  // Row offset for this replay
+        ct->is_complete = false;
+        ct->is_active = true;
+        
+        rt->active_task_count++;
+        rt->total_tasks_scheduled++;
+    }
+    
+    // Re-register outputs in TensorMap with adjusted offsets
+    for (int32_t i = 0; i < frag->output_count; i++) {
+        RecordedOutput* out = &frag->outputs[i];
+        TensorRegion adjusted_region = out->region;
+        
+        switch (ctx->offset_mode) {
+            case OFFSET_ROW:
+                adjusted_region.row_offset += offset_delta;
+                break;
+            case OFFSET_COL:
+                adjusted_region.col_offset += offset_delta;
+                break;
+            case OFFSET_ROW_COL:
+                adjusted_region.row_offset += offset_delta;
+                adjusted_region.col_offset += offset_delta;
+                break;
+            default:
+                break;
+        }
+        
+        int32_t abs_producer = base_id + out->relative_producer;
+        pto_tensormap_insert(rt, &adjusted_region, abs_producer);
+    }
+    
+    rt->next_task_id = base_id + frag->task_count;
+    
+    // Submit ready tasks (fanin == 0)
+    for (int32_t i = 0; i < frag->task_count; i++) {
+        RecordedTask* tmpl = &frag->tasks[i];
+        if (tmpl->fanin == 0) {
+            ready_queue_push_threadsafe(rt, base_id + i);
+        }
+    }
+    
+    DEBUG_PRINT("[Loop Replay] Replayed '%s' at iteration %d (offset_delta=%d, base_id=%d)\n",
+           ctx->loop_name ? ctx->loop_name : "?", loop_idx, offset_delta, base_id);
+}
+
+void pto_loop_cleanup(LoopReplayCtx* ctx) {
+    if (!ctx) return;
+    if (ctx->fragment) {
+        pto_fragment_free(ctx->fragment);
+        ctx->fragment = NULL;
+    }
+}
+
+/**
+ * Validate that task arguments are compatible with the recorded template.
+ * This function compares what would be created at loop_idx against the template.
+ * 
+ * Replay is CORRECT if for each argument:
+ *   1. raw_tensor pointer is identical
+ *   2. col_offset is identical  
+ *   3. rows, cols are identical
+ *   4. row_offset differs by exactly (loop_idx * stride - base_offset)
+ * 
+ * Returns true if compatible, false otherwise (with error message)
+ */
+bool pto_loop_validate_task(LoopReplayCtx* ctx, int32_t task_idx_in_fragment,
+                            int32_t loop_idx, TaskArg* args, int32_t num_args) {
+    if (!ctx || !ctx->fragment || task_idx_in_fragment < 0 || 
+        task_idx_in_fragment >= ctx->fragment->task_count) {
+        fprintf(stderr, "[Replay Validate] ERROR: Invalid context or task index\n");
+        return false;
+    }
+    
+    RecordedTask* tmpl = &ctx->fragment->tasks[task_idx_in_fragment];
+    int32_t expected_offset_delta = (loop_idx * ctx->stride) - ctx->base_offset;
+    
+    // Check argument count matches
+    if (num_args != tmpl->num_args) {
+        fprintf(stderr, "[Replay Validate] ERROR: Task %d arg count mismatch: "
+                "template=%d, actual=%d\n", 
+                task_idx_in_fragment, tmpl->num_args, num_args);
+        return false;
+    }
+    
+    // Check each argument
+    bool valid = true;
+    for (int i = 0; i < num_args; i++) {
+        TaskArg* actual = &args[i];
+        TaskArg* expected = &tmpl->args[i];
+        
+        // 1. raw_tensor must match exactly
+        if (actual->region.raw_tensor != expected->region.raw_tensor) {
+            fprintf(stderr, "[Replay Validate] ERROR: Task %d arg %d tensor pointer mismatch: "
+                    "template=%p, actual=%p\n",
+                    task_idx_in_fragment, i, 
+                    expected->region.raw_tensor, actual->region.raw_tensor);
+            valid = false;
+        }
+        
+        // 2. col_offset must match exactly
+        if (actual->region.col_offset != expected->region.col_offset) {
+            fprintf(stderr, "[Replay Validate] ERROR: Task %d arg %d col_offset mismatch: "
+                    "template=%lld, actual=%lld\n",
+                    task_idx_in_fragment, i,
+                    (long long)expected->region.col_offset, 
+                    (long long)actual->region.col_offset);
+            valid = false;
+        }
+        
+        // 3. Shape (rows, cols) must match exactly
+        if (actual->region.rows != expected->region.rows ||
+            actual->region.cols != expected->region.cols) {
+            fprintf(stderr, "[Replay Validate] ERROR: Task %d arg %d shape mismatch: "
+                    "template=[%lld,%lld], actual=[%lld,%lld]\n",
+                    task_idx_in_fragment, i,
+                    (long long)expected->region.rows, (long long)expected->region.cols,
+                    (long long)actual->region.rows, (long long)actual->region.cols);
+            valid = false;
+        }
+        
+        // 4. row_offset should differ by expected_offset_delta
+        int64_t actual_row_offset = actual->region.row_offset;
+        int64_t expected_row_offset = expected->region.row_offset + expected_offset_delta;
+        
+        // Apply offset mode
+        if (ctx->offset_mode == OFFSET_NONE) {
+            expected_row_offset = expected->region.row_offset;  // No adjustment
+        }
+        
+        if (actual_row_offset != expected_row_offset) {
+            fprintf(stderr, "[Replay Validate] ERROR: Task %d arg %d row_offset mismatch: "
+                    "expected=%lld (template=%lld + delta=%d), actual=%lld\n",
+                    task_idx_in_fragment, i,
+                    (long long)expected_row_offset,
+                    (long long)expected->region.row_offset, expected_offset_delta,
+                    (long long)actual_row_offset);
+            valid = false;
+        }
+        
+        // 5. is_output flag must match
+        if (actual->is_output != expected->is_output) {
+            fprintf(stderr, "[Replay Validate] ERROR: Task %d arg %d is_output mismatch: "
+                    "template=%d, actual=%d\n",
+                    task_idx_in_fragment, i, expected->is_output, actual->is_output);
+            valid = false;
+        }
+    }
+    
+    if (valid) {
+        DEBUG_PRINT("[Replay Validate] Task %d at loop_idx %d: VALID (offset_delta=%d)\n",
+               task_idx_in_fragment, loop_idx, expected_offset_delta);
+    }
+    
+    return valid;
+}
+
+// =============================================================================
 // Helper Macros for Code Generation
 // =============================================================================
 
@@ -850,34 +1285,67 @@ typedef struct {
  * Execute a single task by calling its InCore function
  */
 static void execute_task(PTORuntime* rt, int32_t task_id) {
-    PendingTask* task = &rt->pend_task[task_id];
+    // Check if this is a compact task (replay) or a regular task
+    CompactTask* ct = &rt->compact_task[task_id];
+    bool is_compact = (ct->template_ref != NULL);
     
-    DEBUG_PRINT("[Worker] Executing task %d: %s\n", task_id, task->func_name);
+    // Get task info from appropriate source
+    void* func_ptr;
+    int32_t num_args;
+    TaskArg* task_args;
+    int32_t offset_delta;
+    const char* func_name;
     
-    if (task->func_ptr) {
+    if (is_compact) {
+        RecordedTask* tmpl = ct->template_ref;
+        func_ptr = tmpl->func_ptr;
+        num_args = tmpl->num_args;
+        task_args = tmpl->args;
+        offset_delta = ct->offset_delta;  // Apply replay offset
+        func_name = tmpl->func_name;
+    } else {
+        PendingTask* task = &rt->pend_task[task_id];
+        func_ptr = task->func_ptr;
+        num_args = task->num_args;
+        task_args = task->args;
+        offset_delta = 0;
+        func_name = task->func_name;
+    }
+    
+    DEBUG_PRINT("[Worker] Executing task %d: %s%s\n", task_id, func_name,
+           is_compact ? " (replay)" : "");
+    
+    if (func_ptr) {
         // Build argument array from task arguments
-        // Each TaskArg contains a TensorRegion with raw_tensor pointer and offsets
-        void* args[PTO_MAX_ARGS * 2];  // ptr, offset pairs
+        void* args[PTO_MAX_ARGS * 2];
         int arg_idx = 0;
         
-        for (int i = 0; i < task->num_args; i++) {
-            TaskArg* arg = &task->args[i];
-            // Calculate actual pointer with offset
-            // Assuming float* tensors with row-major layout
+        for (int i = 0; i < num_args; i++) {
+            TaskArg* arg = &task_args[i];
             float* base_ptr = (float*)arg->region.raw_tensor;
-            int64_t offset = arg->region.row_offset * arg->region.cols + arg->region.col_offset;
+            
+            // Only apply offset_delta to tile-varying arguments
+            // Heuristic: if rows > 1 AND matches typical tile size, it's tile-varying
+            // Weights/constants typically have rows=1 or very small rows
+            // Also: if the original row_offset was non-zero, always apply delta
+            bool apply_offset = (offset_delta != 0) && 
+                               (arg->region.row_offset > 0 || arg->region.rows > 1);
+            
+            int64_t row_offset = arg->region.row_offset;
+            if (apply_offset) {
+                row_offset += offset_delta;
+            }
+            
+            int64_t offset = row_offset * arg->region.cols + arg->region.col_offset;
             args[arg_idx++] = (void*)(base_ptr + offset);
         }
         
         // Call the InCore function
-        // The function signature depends on the specific InCore function
-        // For simplicity, we use a generic approach here
-        PTOInCoreFunc func = (PTOInCoreFunc)task->func_ptr;
-        func(args, task->num_args);
+        PTOInCoreFunc func = (PTOInCoreFunc)func_ptr;
+        func(args, num_args);
     } else {
-        // No function pointer - simulate execution
         DEBUG_PRINT("[Worker] Task %d: %s (simulated - no func_ptr)\n", 
-               task_id, task->func_name);
+               task_id, func_name);
     }
 }
 
