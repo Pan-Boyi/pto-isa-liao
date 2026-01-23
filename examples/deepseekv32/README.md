@@ -23,24 +23,24 @@ How to run
 ----------
 Run a PTO frontend to generate backend code:
 ```bash
-python /home/pan-boyi/work/pypto/pto-isa-liao/examples/deepseekv32/<impl>/pto_<impl>.py
+python examples/deepseekv32/<impl>/pto_<impl>.py
 ```
 
 Run the CPU test (auto-selects x86 vs arm64):
 ```bash
-python /home/pan-boyi/work/pypto/pto-isa-liao/examples/deepseekv32/<impl>/test_<impl>.py
+python examples/deepseekv32/<impl>/test_<impl>.py
 ```
 
 Examples
 --------
 Generate and test `sparse_attention_antiquant`:
 ```bash
-python /home/pan-boyi/work/pypto/pto-isa-liao/examples/deepseekv32/sparse_attention_antiquant/pto_sparse_attention_antiquant.py
-python /home/pan-boyi/work/pypto/pto-isa-liao/examples/deepseekv32/sparse_attention_antiquant/test_sparse_attention_antiquant.py
+python examples/deepseekv32/sparse_attention_antiquant/pto_sparse_attention_antiquant.py
+python examples/deepseekv32/sparse_attention_antiquant/test_sparse_attention_antiquant.py
 ```
 
 Generate and test `lightning_indexer_quant`:
 ```bash
-python /home/pan-boyi/work/pypto/pto-isa-liao/examples/deepseekv32/lightning_indexer_quant/pto_lightning_indexer_quant.py
-python /home/pan-boyi/work/pypto/pto-isa-liao/examples/deepseekv32/lightning_indexer_quant/test_lightning_indexer_quant.py
+python examples/deepseekv32/lightning_indexer_quant/pto_lightning_indexer_quant.py
+python examples/deepseekv32/lightning_indexer_quant/test_lightning_indexer_quant.py
 ```
