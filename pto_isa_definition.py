@@ -1520,6 +1520,23 @@ class MSCATTER(TileInstruction):
         return f"mscatter {self.src}, {self.mem}, {self.idx} : {self.mem.memref_type}, {self.src.tile_type}, {self.idx.tile_type}"
 
 
+@dataclass
+class SCATTER_UPDATE(TileInstruction):
+    """Scatter-update: write src rows into dst_mem at linear row indices from row_indices.
+    Semantics (axis=-2 / PA_BSND): for i,j: dst_mem[(int)row_indices[i,0]*src_cols + j] = src[i,j].
+    row_indices shape is (src_rows, 1). Used for K-cache write-back in indexer_prolog."""
+    dst_mem: MemRefOperand
+    src: TileOperand
+    row_indices: TileOperand
+
+    @property
+    def opcode(self) -> str:
+        return "SCATTER_UPDATE"
+
+    def to_pto_as(self) -> str:
+        return f"scatter_update {self.dst_mem}, {self.src}, {self.row_indices} : {self.dst_mem.memref_type}, {self.src.tile_type}, {self.row_indices.tile_type}"
+
+
 # =============================================================================
 # Tile Instructions - Element Access
 # =============================================================================
@@ -2942,6 +2959,29 @@ class TEXTRACT(TileInstruction):
 
 
 @dataclass
+class TCONCAT(TileInstruction):
+    """Concatenate two tiles along the given axis.
+    
+    axis=0 (row): dst = [first; second], dst.rows = first.rows+second.rows, dst.cols = first.cols = second.cols.
+        first -> dst[0:r1, :], second -> dst[r1:r1+r2, :].
+    axis=1 (col): dst = [first|second], dst.rows = first.rows = second.rows, dst.cols = first.cols+second.cols.
+        first -> dst[:, 0:c1], second -> dst[:, c1:c1+c2]. Used for RoPE rotate_half.
+    """
+    dst: TileOperand
+    src_left: TileOperand
+    src_right: TileOperand
+    axis: int = 1  # 0=沿行堆叠, 1=沿列拼接 (default 1 for RoPE)
+    
+    @property
+    def opcode(self) -> str:
+        return "TCONCAT"
+    
+    def to_pto_as(self) -> str:
+        ax = "row" if self.axis == 0 else "col"
+        return f"{self.dst} = tconcat {self.src_left}, {self.src_right} ({ax}) : {self.dst.tile_type}"
+
+
+@dataclass
 class TGATHER(TileInstruction):
     """Gather/select elements using an index tile."""
     dst: TileOperand
@@ -3749,6 +3789,7 @@ TILE_INSTRUCTIONS = {
     "TTRANS": TTRANS,
     "TRESHAPE": TRESHAPE,
     "TEXTRACT": TEXTRACT,
+    "TCONCAT": TCONCAT,
     "TGATHER": TGATHER,
     "TGATHERB": TGATHERB,
     "TSCATTER": TSCATTER,

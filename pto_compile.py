@@ -41,6 +41,15 @@ from pto_isa_definition import (
     # Memory operations (manually handled - not auto-generated)
     TLOAD, TSTORE,
     
+    # Scatter/gather (manually handled)
+    TSCATTER, MSCATTER, SCATTER_UPDATE,
+    
+    # Tile data-movement (for RoPE: extract, concat)
+    TEXTRACT, TCONCAT,
+    
+    # Type conversion (for quant_int8)
+    TCVT,
+    
     # Instructions used by TypeChecker (type hints)
     TMATMUL,
     
@@ -502,6 +511,93 @@ class PTOFunctionBuilder:
         ))
         return self
     
+    def extract(self, dst: str, src: str, 
+                row: Union[int, str] = 0, col: Union[int, str] = 0) -> "PTOFunctionBuilder":
+        """Extract a sub-tile from a source tile.
+        
+        TEXTRACT: dst[0:dst.rows, 0:dst.cols] = src[row:row+dst.rows, col:col+dst.cols]
+        The shape of dst must match the extracted region (src rows - row, src cols - col).
+        
+        Args:
+            dst: Destination tile name (must be declared with target shape)
+            src: Source tile name
+            row: Start row in source (int or index variable)
+            col: Start column in source (int or index variable)
+        """
+        row_op = ImmediateOperand(row) if isinstance(row, int) else IndexOperand(row)
+        col_op = ImmediateOperand(col) if isinstance(col, int) else IndexOperand(col)
+        self._add_instr(TEXTRACT(
+            dst=self._get_tile(dst),
+            src=self._get_tile(src),
+            r0=row_op,
+            r1=col_op
+        ))
+        return self
+    
+    def concat(self, dst: str, first: str, second: str, axis: int = 1) -> "PTOFunctionBuilder":
+        """Concatenate two tiles along axis.
+        
+        TCONCAT: axis=0 dst=[first;second] (stack rows), axis=1 dst=[first|second] (horizontal).
+        axis=0: dst.rows = first.rows+second.rows, dst.cols = first.cols = second.cols.
+        axis=1: dst.rows = first.rows = second.rows, dst.cols = first.cols+second.cols.
+        Used for RoPE rotate_half: concat(rotated, right_neg, left, axis=1) -> [-right_half | left_half].
+        
+        Args:
+            dst: Destination tile
+            first: First tile
+            second: Second tile
+            axis: 0=沿行堆叠, 1=沿列拼接 (default 1)
+        """
+        self._add_instr(TCONCAT(
+            dst=self._get_tile(dst),
+            src_left=self._get_tile(first),
+            src_right=self._get_tile(second),
+            axis=int(axis)
+        ))
+        return self
+    
+    def concat_col(self, dst: str, left: str, right: str) -> "PTOFunctionBuilder":
+        """Alias for concat(..., axis=1). Concatenate along columns: dst = [left | right]."""
+        return self.concat(dst, left, right, axis=1)
+
+    def scatter(self, dst: str, src: str, idx: str) -> "PTOFunctionBuilder":
+        """TSCATTER: scatter tile to tile. dst[idx[i,j], j] = src[i,j]. idx gives row index per element."""
+        self._add_instr(TSCATTER(
+            dst=self._get_tile(dst),
+            src=self._get_tile(src),
+            idx=self._get_tile(idx)
+        ))
+        return self
+
+    def mscatter(self, src: str, dst_mem: str, idx: str) -> "PTOFunctionBuilder":
+        """MSCATTER: scatter tile to GM. dst_mem[idx[i,j]] = src[i,j]. idx is linear element index, same shape as src."""
+        self._add_instr(MSCATTER(
+            src=self._get_tile(src),
+            mem=self._get_memref(dst_mem),
+            idx=self._get_tile(idx)
+        ))
+        return self
+
+    def scatter_update(self, dst_mem: str, src: str, row_indices: str) -> "PTOFunctionBuilder":
+        """SCATTER_UPDATE: write src into dst_mem at rows from row_indices (axis=-2).
+        For i,j: dst_mem[(int)row_indices[i,0]*src_cols + j] = src[i,j]. row_indices shape (rows,1)."""
+        self._add_instr(SCATTER_UPDATE(
+            dst_mem=self._get_memref(dst_mem),
+            src=self._get_tile(src),
+            row_indices=self._get_tile(row_indices)
+        ))
+        return self
+
+    def tcvt(self, dst: str, src: str, rmode: RoundMode = RoundMode.CAST_RINT) -> "PTOFunctionBuilder":
+        """TCVT: elementwise type conversion with rounding. dst = cast(round_rmode(src)).
+        For quant_int8: F32->I8 with CAST_RINT (rint then cast)."""
+        self._add_instr(TCVT(
+            dst=self._get_tile(dst),
+            src=self._get_tile(src),
+            rmode=rmode
+        ))
+        return self
+
     # =========================================================================
     # Tile Operations - Auto-generated from INSTRUCTION_METADATA
     # =========================================================================
@@ -1884,6 +1980,14 @@ OPCODE_CATEGORY = {
     # Memory
     "TLOAD": OpCategory.MEMORY,
     "TSTORE": OpCategory.MEMORY,
+
+    # Scatter (fusion barrier: indexed memory write)
+    "TSCATTER": OpCategory.OTHER,
+    "MSCATTER": OpCategory.OTHER,
+    "SCATTER_UPDATE": OpCategory.OTHER,
+
+    # Type conversion (fusion barrier: type change)
+    "TCVT": OpCategory.OTHER,
     
     # Control flow
     "FOR": OpCategory.CONTROL_FLOW,
@@ -1928,8 +2032,9 @@ def is_fusable(opcode: str) -> bool:
 def is_fusion_barrier(opcode: str) -> bool:
     """Check if an operation is a fusion barrier (stops fusion)."""
     category = get_category(opcode)
-    # Scalar instructions, control flow, and function calls act as fusion barriers
-    if opcode in ("SLI", "SCMP", "SADD", "SSUB", "SMUL", "SDIV", "SMOV", "CALL", "RETURN"):
+    # Scalar instructions, control flow, function calls, and scatter ops act as fusion barriers
+    if opcode in ("SLI", "SCMP", "SADD", "SSUB", "SMUL", "SDIV", "SMOV", "CALL", "RETURN",
+                  "TSCATTER", "MSCATTER", "SCATTER_UPDATE", "TCVT", "TCOLEXPAND"):
         return True
     return category in {
         OpCategory.REDUCTION,
@@ -2230,6 +2335,7 @@ class FusedCodeGenerator:
         cols = fused.shape.cols
         dtype = fused.shape.dtype
         
+        use_vector = dtype in ("f32", "f16")
         vec_lanes = 4 if dtype == "f32" else 8 if dtype == "f16" else 4
         suffix = "f32" if dtype == "f32" else "f16" if dtype == "f16" else "f32"
         vec_type = f"float32x4_t" if dtype == "f32" else f"float16x8_t" if dtype == "f16" else "float32x4_t"
@@ -2237,47 +2343,48 @@ class FusedCodeGenerator:
         op_names = [f"{op.dst}={op.opcode}({','.join(op.operands)})" for op in fused.operations]
         lines.append(f"{indent}// FUSED LOOP ({len(fused.operations)} ops): {'; '.join(op_names)}")
         
-        # Pre-compute scalar broadcast vectors
+        # Pre-compute scalar broadcast vectors (only for float when vectorized)
         scalar_vars = {}
-        for op in fused.operations:
-            if get_category(op.opcode) == OpCategory.ELEMENTWISE_SCALAR:
-                scalar_val = op.operands[1]
-                if scalar_val not in scalar_vars:
-                    var_name = self._get_unique_var("_vs")
-                    scalar_vars[scalar_val] = var_name
-                    lines.append(f"{indent}{vec_type} {var_name} = vdupq_n_{suffix}({scalar_val});")
-            elif op.opcode == "TEXPANDS":
-                scalar_val = op.operands[0]
-                if scalar_val not in scalar_vars:
-                    var_name = self._get_unique_var("_vs")
-                    scalar_vars[scalar_val] = var_name
-                    lines.append(f"{indent}{vec_type} {var_name} = vdupq_n_{suffix}({scalar_val});")
+        if use_vector:
+            for op in fused.operations:
+                if get_category(op.opcode) == OpCategory.ELEMENTWISE_SCALAR:
+                    scalar_val = op.operands[1]
+                    if scalar_val not in scalar_vars:
+                        var_name = self._get_unique_var("_vs")
+                        scalar_vars[scalar_val] = var_name
+                        lines.append(f"{indent}{vec_type} {var_name} = vdupq_n_{suffix}({scalar_val});")
+                elif op.opcode == "TEXPANDS":
+                    scalar_val = op.operands[0]
+                    if scalar_val not in scalar_vars:
+                        var_name = self._get_unique_var("_vs")
+                        scalar_vars[scalar_val] = var_name
+                        lines.append(f"{indent}{vec_type} {var_name} = vdupq_n_{suffix}({scalar_val});")
         
         lines.append(f"{indent}for (int _row = 0; _row < {rows}; _row++) {{")
         self.indent_level += 1
         indent = self._indent()
         
-        lines.append(f"{indent}int _col;")
-        lines.append(f"{indent}// Vectorized loop")
-        lines.append(f"{indent}for (_col = 0; _col + {vec_lanes} <= {cols}; _col += {vec_lanes}) {{")
+        if use_vector:
+            lines.append(f"{indent}int _col;")
+            lines.append(f"{indent}// Vectorized loop")
+            lines.append(f"{indent}for (_col = 0; _col + {vec_lanes} <= {cols}; _col += {vec_lanes}) {{")
+            self.indent_level += 1
+            for op in fused.operations:
+                vec_lines = self._gen_vectorized_op(op, suffix, vec_type, scalar_vars)
+                lines.extend(vec_lines)
+            self.indent_level -= 1
+            indent = self._indent()
+            lines.append(f"{indent}}}")
+            lines.append(f"{indent}// Scalar cleanup")
+            lines.append(f"{indent}for (; _col < {cols}; _col++) {{")
+        else:
+            # i64 or other: scalar-only (FusedCodeGenerator has no int64 NEON path)
+            lines.append(f"{indent}for (int _col = 0; _col < {cols}; _col++) {{")
+        
         self.indent_level += 1
-        
-        for op in fused.operations:
-            vec_lines = self._gen_vectorized_op(op, suffix, vec_type, scalar_vars)
-            lines.extend(vec_lines)
-        
-        self.indent_level -= 1
-        indent = self._indent()
-        lines.append(f"{indent}}}")
-        
-        lines.append(f"{indent}// Scalar cleanup")
-        lines.append(f"{indent}for (; _col < {cols}; _col++) {{")
-        self.indent_level += 1
-        
         for op in fused.operations:
             scalar_lines = self._gen_scalar_op(op)
             lines.extend(scalar_lines)
-        
         self.indent_level -= 1
         indent = self._indent()
         lines.append(f"{indent}}}")
@@ -2626,6 +2733,11 @@ def convert_program_to_mock_instructions(program):
                 opcode=opcode, dst=instr.dst.name,
                 operands=[instr.src0.name, instr.src1.name]
             ))
+        elif opcode == "TCOLEXPAND":
+            mock_instructions.append(MockInstruction(
+                opcode="TCOLEXPAND", dst=instr.dst.name,
+                operands=[instr.src.name]
+            ))
         elif opcode == "TMATMUL":
             mock_instructions.append(MockInstruction(
                 opcode=opcode, dst=instr.dst.name,
@@ -2646,6 +2758,41 @@ def convert_program_to_mock_instructions(program):
             mock_instructions.append(MockInstruction(
                 opcode="TSTORE", dst=instr.dst_mem.name,
                 operands=[instr.src.name, row_off, col_off]
+            ))
+        elif opcode == "TEXTRACT":
+            row_off = _get_operand_str(instr.r0)
+            col_off = _get_operand_str(instr.r1)
+            mock_instructions.append(MockInstruction(
+                opcode="TEXTRACT", dst=instr.dst.name,
+                operands=[instr.src.name, row_off, col_off]
+            ))
+        elif opcode == "TCONCAT":
+            axis = getattr(instr, "axis", 1)
+            mock_instructions.append(MockInstruction(
+                opcode="TCONCAT", dst=instr.dst.name,
+                operands=[instr.src_left.name, instr.src_right.name, str(axis)]
+            ))
+        elif opcode == "TSCATTER":
+            mock_instructions.append(MockInstruction(
+                opcode="TSCATTER", dst=instr.dst.name,
+                operands=[instr.src.name, instr.idx.name]
+            ))
+        elif opcode == "MSCATTER":
+            mock_instructions.append(MockInstruction(
+                opcode="MSCATTER", dst=instr.mem.name,
+                operands=[instr.src.name, instr.idx.name]
+            ))
+        elif opcode == "SCATTER_UPDATE":
+            mock_instructions.append(MockInstruction(
+                opcode="SCATTER_UPDATE", dst=instr.dst_mem.name,
+                operands=[instr.src.name, instr.row_indices.name]
+            ))
+        elif opcode == "TCVT":
+            rmode = getattr(instr, "rmode", None)
+            rmode_name = getattr(rmode, "name", "CAST_RINT") if rmode is not None else "CAST_RINT"
+            mock_instructions.append(MockInstruction(
+                opcode="TCVT", dst=instr.dst.name,
+                operands=[instr.src.name, rmode_name]
             ))
         # =========== Control Flow Instructions ===========
         elif opcode == "FOR":
@@ -3282,6 +3429,94 @@ def _gen_arm64_barrier_op(instr, rows, cols, dtype, tile_info, orch_ctx: Optiona
         else:
             lines.append(f"        {dst_mem}[({row_offset_expr} + _row) * {cols} + {col_offset_expr} + _col] = {src}[_row][_col];")
         lines.append(f"    }}}}")
+
+    elif instr.opcode == "TSCATTER":
+        dst, src, idx = instr.dst, instr.operands[0], instr.operands[1]
+        lines.append(f"// TSCATTER: {dst}[{idx}[i,j], j] = {src}[i,j]")
+        lines.append(f"for (int _i = 0; _i < {rows}; _i++) {{")
+        lines.append(f"    for (int _j = 0; _j < {cols}; _j++) {{")
+        lines.append(f"        int _r = (int){idx}[_i][_j];")
+        lines.append(f"        {dst}[_r][_j] = {src}[_i][_j];")
+        lines.append(f"    }}}}")
+
+    elif instr.opcode == "MSCATTER":
+        dst_mem, src, idx = instr.dst, instr.operands[0], instr.operands[1]
+        lines.append(f"// MSCATTER: {dst_mem}[{idx}[i,j]] = {src}[i,j] (linear index)")
+        lines.append(f"for (int _i = 0; _i < {rows}; _i++) {{")
+        lines.append(f"    for (int _j = 0; _j < {cols}; _j++) {{")
+        lines.append(f"        int _lin = (int){idx}[_i][_j];")
+        lines.append(f"        {dst_mem}[_lin] = {src}[_i][_j];")
+        lines.append(f"    }}}}")
+
+    elif instr.opcode == "SCATTER_UPDATE":
+        dst_mem, src, row_indices = instr.dst, instr.operands[0], instr.operands[1]
+        lines.append(f"// SCATTER_UPDATE: {dst_mem}[{row_indices}[i,0]*{cols}+j] = {src}[i,j] (axis=-2)")
+        lines.append(f"for (int _i = 0; _i < {rows}; _i++) {{")
+        lines.append(f"    int _row = (int){row_indices}[_i][0];")
+        lines.append(f"    for (int _j = 0; _j < {cols}; _j++) {{")
+        lines.append(f"        {dst_mem}[_row * {cols} + _j] = {src}[_i][_j];")
+        lines.append(f"    }}}}")
+
+    elif instr.opcode == "TCVT":
+        dst, src = instr.dst, instr.operands[0]
+        rmode = instr.operands[1] if len(instr.operands) > 1 else "CAST_RINT"
+        src_info = tile_info.get(src)
+        src_dtype = src_info.dtype if src_info else "f32"
+        dst_c = ARM64_TYPE_MAP.get(dtype, "float")
+        if dtype == "i8" and src_dtype == "f32":
+            lines.append(f"// TCVT: {dst} = (int8_t)lrintf({src}) F32->I8 rmode={rmode}")
+            lines.append(f"for (int _i = 0; _i < {rows}; _i++) {{")
+            lines.append(f"    for (int _j = 0; _j < {cols}; _j++) {{")
+            lines.append(f"        {dst}[_i][_j] = (int8_t)lrintf({src}[_i][_j]);")
+            lines.append(f"    }}}}")
+        else:
+            lines.append(f"// TCVT: {dst} = ({dst_c})({src}) rmode={rmode}")
+            lines.append(f"for (int _i = 0; _i < {rows}; _i++) {{")
+            lines.append(f"    for (int _j = 0; _j < {cols}; _j++) {{")
+            lines.append(f"        {dst}[_i][_j] = ({dst_c})({src}[_i][_j]);")
+            lines.append(f"    }}}}")
+        
+    elif instr.opcode == "TEXTRACT":
+        dst, src = instr.dst, instr.operands[0]
+        idx_row = instr.operands[1] if len(instr.operands) > 1 else "0"
+        idx_col = instr.operands[2] if len(instr.operands) > 2 else "0"
+        d = tile_info.get(dst)
+        rows_d = d.rows if d else rows
+        cols_d = d.cols if d else cols
+        lines.append(f"// TEXTRACT: {dst} = extract({src}, [{idx_row}, {idx_col}])")
+        lines.append(f"for (int _row = 0; _row < {rows_d}; _row++) {{")
+        lines.append(f"    for (int _col = 0; _col < {cols_d}; _col++) {{")
+        lines.append(f"        {dst}[_row][_col] = {src}[({idx_row}) + _row][({idx_col}) + _col];")
+        lines.append(f"    }}}}")
+    
+    elif instr.opcode == "TCONCAT":
+        dst, first, second = instr.dst, instr.operands[0], instr.operands[1]
+        axis = int(instr.operands[2]) if len(instr.operands) > 2 else 1
+        first_info = tile_info.get(first)
+        second_info = tile_info.get(second)
+        r1 = first_info.rows if first_info else (rows // 2 if axis == 0 else rows)
+        c1 = first_info.cols if first_info else (cols // 2 if axis == 1 else cols)
+        r2 = second_info.rows if second_info else (rows - r1 if axis == 0 else rows)
+        c2 = second_info.cols if second_info else (cols - c1 if axis == 1 else cols)
+        if axis == 0:
+            lines.append(f"// TCONCAT(axis=0): {dst} = [ {first}; {second} ]")
+            lines.append(f"for (int _row = 0; _row < {r1}; _row++) {{")
+            lines.append(f"    for (int _col = 0; _col < {cols}; _col++) {{")
+            lines.append(f"        {dst}[_row][_col] = {first}[_row][_col];")
+            lines.append(f"    }}}}")
+            lines.append(f"for (int _row = 0; _row < {r2}; _row++) {{")
+            lines.append(f"    for (int _col = 0; _col < {cols}; _col++) {{")
+            lines.append(f"        {dst}[{r1} + _row][_col] = {second}[_row][_col];")
+            lines.append(f"    }}}}")
+        else:
+            lines.append(f"// TCONCAT(axis=1): {dst} = [ {first} | {second} ]")
+            lines.append(f"for (int _row = 0; _row < {rows}; _row++) {{")
+            lines.append(f"    for (int _col = 0; _col < {c1}; _col++) {{")
+            lines.append(f"        {dst}[_row][_col] = {first}[_row][_col];")
+            lines.append(f"    }}")
+            lines.append(f"    for (int _col = 0; _col < {c2}; _col++) {{")
+            lines.append(f"        {dst}[_row][{c1} + _col] = {second}[_row][_col];")
+            lines.append(f"    }}}}")
         
     elif instr.opcode == "TROWSUM":
         dst, src = instr.dst, instr.operands[0]
@@ -3328,6 +3563,20 @@ def _gen_arm64_barrier_op(instr, rows, cols, dtype, tile_info, orch_ctx: Optiona
         lines.append(f"    {c_type} _broadcast_val = {src1}[_row][0];")
         lines.append(f"    for (int _col = 0; _col < {cols}; _col++) {{")
         lines.append(f"        {dst}[_row][_col] = {src0}[_row][_col] {op} _broadcast_val;")
+        lines.append(f"    }}}}")
+    
+    elif instr.opcode == "TCOLEXPAND":
+        dst = getattr(instr, 'dst', None)
+        src = getattr(instr, 'src', instr.operands[0] if getattr(instr, 'operands', None) and len(instr.operands) > 0 else None)
+        dst_n = getattr(dst, 'name', str(dst)) if dst is not None else "dst"
+        src_n = getattr(src, 'name', str(src)) if src is not None else "src"
+        d = tile_info.get(dst_n) if dst is not None else None
+        rows_d = d.rows if d else rows
+        cols_d = d.cols if d else cols
+        lines.append(f"// TCOLEXPAND: {dst_n} = broadcast first row of {src_n} -> dst[i,j]=src[0,j]")
+        lines.append(f"for (int _i = 0; _i < {rows_d}; _i++) {{")
+        lines.append(f"    for (int _j = 0; _j < {cols_d}; _j++) {{")
+        lines.append(f"        {dst_n}[_i][_j] = {src_n}[0][_j];")
         lines.append(f"    }}}}")
         
     elif instr.opcode == "TMATMUL":
@@ -3648,6 +3897,92 @@ def _gen_cuda_barrier_op(instr, rows, cols, dtype, tile_info):
             lines.append(f"if (_row < {rows} && _col < {cols}) {dst_mem}[_row * {cols} + _col] = {src}[_row][_col];")
         else:
             lines.append(f"if (_row < {rows} && _col < {cols}) {dst_mem}[({row_offset_expr} + _row) * {cols} + {col_offset_expr} + _col] = {src}[_row][_col];")
+
+    elif instr.opcode == "TSCATTER":
+        dst, src, idx = instr.dst, instr.operands[0], instr.operands[1]
+        lines.append(f"// TSCATTER: {dst}[{idx}[i,j], j] = {src}[i,j]")
+        lines.append(f"for (int _i = 0; _i < {rows}; _i++) {{")
+        lines.append(f"    for (int _j = 0; _j < {cols}; _j++) {{")
+        lines.append(f"        int _r = (int){idx}[_i][_j];")
+        lines.append(f"        {dst}[_r][_j] = {src}[_i][_j];")
+        lines.append(f"    }}}}")
+
+    elif instr.opcode == "MSCATTER":
+        dst_mem, src, idx = instr.dst, instr.operands[0], instr.operands[1]
+        lines.append(f"// MSCATTER: {dst_mem}[{idx}[i,j]] = {src}[i,j]")
+        lines.append(f"for (int _i = 0; _i < {rows}; _i++) {{")
+        lines.append(f"    for (int _j = 0; _j < {cols}; _j++) {{")
+        lines.append(f"        int _lin = (int){idx}[_i][_j];")
+        lines.append(f"        {dst_mem}[_lin] = {src}[_i][_j];")
+        lines.append(f"    }}}}")
+
+    elif instr.opcode == "SCATTER_UPDATE":
+        dst_mem, src, row_indices = instr.dst, instr.operands[0], instr.operands[1]
+        lines.append(f"// SCATTER_UPDATE: {dst_mem}[{row_indices}[i,0]*{cols}+j] = {src}[i,j]")
+        lines.append(f"for (int _i = 0; _i < {rows}; _i++) {{")
+        lines.append(f"    int _row = (int){row_indices}[_i][0];")
+        lines.append(f"    for (int _j = 0; _j < {cols}; _j++) {{")
+        lines.append(f"        {dst_mem}[_row * {cols} + _j] = {src}[_i][_j];")
+        lines.append(f"    }}}}")
+    
+    elif instr.opcode == "TCVT":
+        dst, src = instr.dst, instr.operands[0]
+        rmode = instr.operands[1] if len(instr.operands) > 1 else "CAST_RINT"
+        dst_c = "int8_t" if dtype == "i8" else "float"
+        if dtype == "i8":
+            lines.append(f"// TCVT: {dst} = (int8_t)lrintf({src}) F32->I8 rmode={rmode}")
+            lines.append(f"for (int _i = 0; _i < {rows}; _i++) {{")
+            lines.append(f"    for (int _j = 0; _j < {cols}; _j++) {{")
+            lines.append(f"        {dst}[_i][_j] = (int8_t)lrintf({src}[_i][_j]);")
+            lines.append(f"    }}}}")
+        else:
+            lines.append(f"// TCVT: {dst} = ({dst_c})({src}) rmode={rmode}")
+            lines.append(f"for (int _i = 0; _i < {rows}; _i++) {{")
+            lines.append(f"    for (int _j = 0; _j < {cols}; _j++) {{")
+            lines.append(f"        {dst}[_i][_j] = ({dst_c})({src}[_i][_j]);")
+            lines.append(f"    }}}}")
+    
+    elif instr.opcode == "TEXTRACT":
+        dst, src = instr.dst, instr.operands[0]
+        idx_row = instr.operands[1] if len(instr.operands) > 1 else "0"
+        idx_col = instr.operands[2] if len(instr.operands) > 2 else "0"
+        d = tile_info.get(dst)
+        rows_d = d.rows if d else rows
+        cols_d = d.cols if d else cols
+        lines.append(f"// TEXTRACT: {dst} = extract({src}, [{idx_row}, {idx_col}])")
+        lines.append(f"for (int _r = 0; _r < {rows_d}; _r++) {{")
+        lines.append(f"    for (int _c = 0; _c < {cols_d}; _c++) {{")
+        lines.append(f"        {dst}[_r][_c] = {src}[({idx_row}) + _r][({idx_col}) + _c];")
+        lines.append(f"    }}}}")
+    
+    elif instr.opcode == "TCONCAT":
+        dst, first, second = instr.dst, instr.operands[0], instr.operands[1]
+        axis = int(instr.operands[2]) if len(instr.operands) > 2 else 1
+        first_info = tile_info.get(first)
+        second_info = tile_info.get(second)
+        r1 = first_info.rows if first_info else (rows // 2 if axis == 0 else rows)
+        c1 = first_info.cols if first_info else (cols // 2 if axis == 1 else cols)
+        r2 = second_info.rows if second_info else (rows - r1 if axis == 0 else rows)
+        c2 = second_info.cols if second_info else (cols - c1 if axis == 1 else cols)
+        if axis == 0:
+            lines.append(f"// TCONCAT(axis=0): {dst} = [ {first}; {second} ]")
+            lines.append(f"for (int _r = 0; _r < {r1}; _r++) {{")
+            lines.append(f"    for (int _c = 0; _c < {cols}; _c++) {{")
+            lines.append(f"        {dst}[_r][_c] = {first}[_r][_c];")
+            lines.append(f"    }}}}")
+            lines.append(f"for (int _r = 0; _r < {r2}; _r++) {{")
+            lines.append(f"    for (int _c = 0; _c < {cols}; _c++) {{")
+            lines.append(f"        {dst}[{r1} + _r][_c] = {second}[_r][_c];")
+            lines.append(f"    }}}}")
+        else:
+            lines.append(f"// TCONCAT(axis=1): {dst} = [ {first} | {second} ]")
+            lines.append(f"for (int _r = 0; _r < {rows}; _r++) {{")
+            lines.append(f"    for (int _c = 0; _c < {c1}; _c++) {{")
+            lines.append(f"        {dst}[_r][_c] = {first}[_r][_c];")
+            lines.append(f"    }}")
+            lines.append(f"    for (int _c = 0; _c < {c2}; _c++) {{")
+            lines.append(f"        {dst}[_r][{c1} + _c] = {second}[_r][_c];")
+            lines.append(f"    }}}}")
         
     elif instr.opcode == "TROWSUM":
         dst, src = instr.dst, instr.operands[0]
@@ -3838,6 +4173,92 @@ def _gen_ascend_barrier_op(instr, rows, cols, dtype, tile_info):
         tile_size = rows * cols
         lines.append(f"// TSTORE: store({src}) -> {dst_mem}[{row_off}, {col_off}]")
         lines.append(f"DataCopy({dst_mem}[({row_off}) * {tile_size}], {src}, {tile_size});")
+
+    elif instr.opcode == "TSCATTER":
+        dst, src, idx = instr.dst, instr.operands[0], instr.operands[1]
+        lines.append(f"// TSCATTER: {dst}[{idx}[i,j], j] = {src}[i,j]")
+        lines.append(f"for (int _i = 0; _i < {rows}; _i++) {{")
+        lines.append(f"    for (int _j = 0; _j < {cols}; _j++) {{")
+        lines.append(f"        int _r = (int){idx}[_i][_j];")
+        lines.append(f"        {dst}[_r][_j] = {src}[_i][_j];")
+        lines.append(f"    }}}}")
+
+    elif instr.opcode == "MSCATTER":
+        dst_mem, src, idx = instr.dst, instr.operands[0], instr.operands[1]
+        lines.append(f"// MSCATTER: {dst_mem}[{idx}[i,j]] = {src}[i,j]")
+        lines.append(f"for (int _i = 0; _i < {rows}; _i++) {{")
+        lines.append(f"    for (int _j = 0; _j < {cols}; _j++) {{")
+        lines.append(f"        int _lin = (int){idx}[_i][_j];")
+        lines.append(f"        {dst_mem}[_lin] = {src}[_i][_j];")
+        lines.append(f"    }}}}")
+
+    elif instr.opcode == "SCATTER_UPDATE":
+        dst_mem, src, row_indices = instr.dst, instr.operands[0], instr.operands[1]
+        lines.append(f"// SCATTER_UPDATE: {dst_mem}[{row_indices}[i,0]*{cols}+j] = {src}[i,j]")
+        lines.append(f"for (int _i = 0; _i < {rows}; _i++) {{")
+        lines.append(f"    int _row = (int){row_indices}[_i][0];")
+        lines.append(f"    for (int _j = 0; _j < {cols}; _j++) {{")
+        lines.append(f"        {dst_mem}[_row * {cols} + _j] = {src}[_i][_j];")
+        lines.append(f"    }}}}")
+    
+    elif instr.opcode == "TCVT":
+        dst, src = instr.dst, instr.operands[0]
+        rmode = instr.operands[1] if len(instr.operands) > 1 else "CAST_RINT"
+        dst_c = "int8_t" if dtype == "i8" else "float"
+        if dtype == "i8":
+            lines.append(f"// TCVT: {dst} = (int8_t)lrintf({src}) F32->I8 rmode={rmode}")
+            lines.append(f"for (int _i = 0; _i < {rows}; _i++) {{")
+            lines.append(f"    for (int _j = 0; _j < {cols}; _j++) {{")
+            lines.append(f"        {dst}[_i][_j] = (int8_t)lrintf({src}[_i][_j]);")
+            lines.append(f"    }}}}")
+        else:
+            lines.append(f"// TCVT: {dst} = ({dst_c})({src}) rmode={rmode}")
+            lines.append(f"for (int _i = 0; _i < {rows}; _i++) {{")
+            lines.append(f"    for (int _j = 0; _j < {cols}; _j++) {{")
+            lines.append(f"        {dst}[_i][_j] = ({dst_c})({src}[_i][_j]);")
+            lines.append(f"    }}}}")
+    
+    elif instr.opcode == "TEXTRACT":
+        dst, src = instr.dst, instr.operands[0]
+        idx_row = instr.operands[1] if len(instr.operands) > 1 else "0"
+        idx_col = instr.operands[2] if len(instr.operands) > 2 else "0"
+        d = tile_info.get(dst)
+        rows_d = d.rows if d else rows
+        cols_d = d.cols if d else cols
+        lines.append(f"// TEXTRACT: {dst} = extract({src}, [{idx_row}, {idx_col}])")
+        lines.append(f"for (int _r = 0; _r < {rows_d}; _r++) {{")
+        lines.append(f"    for (int _c = 0; _c < {cols_d}; _c++) {{")
+        lines.append(f"        {dst}[_r][_c] = {src}[({idx_row}) + _r][({idx_col}) + _c];")
+        lines.append(f"    }}}}")
+    
+    elif instr.opcode == "TCONCAT":
+        dst, first, second = instr.dst, instr.operands[0], instr.operands[1]
+        axis = int(instr.operands[2]) if len(instr.operands) > 2 else 1
+        first_info = tile_info.get(first)
+        second_info = tile_info.get(second)
+        r1 = first_info.rows if first_info else (rows // 2 if axis == 0 else rows)
+        c1 = first_info.cols if first_info else (cols // 2 if axis == 1 else cols)
+        r2 = second_info.rows if second_info else (rows - r1 if axis == 0 else rows)
+        c2 = second_info.cols if second_info else (cols - c1 if axis == 1 else cols)
+        if axis == 0:
+            lines.append(f"// TCONCAT(axis=0): {dst} = [ {first}; {second} ]")
+            lines.append(f"for (int _r = 0; _r < {r1}; _r++) {{")
+            lines.append(f"    for (int _c = 0; _c < {cols}; _c++) {{")
+            lines.append(f"        {dst}[_r][_c] = {first}[_r][_c];")
+            lines.append(f"    }}}}")
+            lines.append(f"for (int _r = 0; _r < {r2}; _r++) {{")
+            lines.append(f"    for (int _c = 0; _c < {cols}; _c++) {{")
+            lines.append(f"        {dst}[{r1} + _r][_c] = {second}[_r][_c];")
+            lines.append(f"    }}}}")
+        else:
+            lines.append(f"// TCONCAT(axis=1): {dst} = [ {first} | {second} ]")
+            lines.append(f"for (int _r = 0; _r < {rows}; _r++) {{")
+            lines.append(f"    for (int _c = 0; _c < {c1}; _c++) {{")
+            lines.append(f"        {dst}[_r][_c] = {first}[_r][_c];")
+            lines.append(f"    }}")
+            lines.append(f"    for (int _c = 0; _c < {c2}; _c++) {{")
+            lines.append(f"        {dst}[_r][{c1} + _c] = {second}[_r][_c];")
+            lines.append(f"    }}}}")
         
     elif instr.opcode == "TROWSUM":
         tile_size = rows * cols
@@ -4266,6 +4687,9 @@ class MultiBackendCodeGenerator:
                 elif isinstance(item, FusionBarrier):
                     instr = item.raw_instr
                     info = tile_info.get(instr.dst) if instr.dst else None
+                    # MSCATTER/SCATTER_UPDATE: dst is memref; get shape from src tile (operands[0])
+                    if instr.opcode in ("MSCATTER", "SCATTER_UPDATE") and instr.operands:
+                        info = tile_info.get(instr.operands[0]) or info
                     # Use OrchestrationContext defaults if available, else standard tile size
                     default_rows = orch_ctx.default_tile_rows if orch_ctx else 32
                     default_cols = orch_ctx.default_tile_cols if orch_ctx else 128
@@ -4308,6 +4732,10 @@ class MultiBackendCodeGenerator:
             for instr in program.instructions:
                 op = getattr(instr, "opcode", "")
                 if op in ("TSTORE", "TSTORE_FP"):
+                    written_memrefs.add(instr.dst_mem.name)
+                elif op == "MSCATTER":
+                    written_memrefs.add(instr.mem.name)
+                elif op == "SCATTER_UPDATE":
                     written_memrefs.add(instr.dst_mem.name)
                 if op == "TLOAD":
                     tile_t = program.tile_declarations.get(instr.dst.name)
@@ -4526,6 +4954,8 @@ class MultiBackendCodeGenerator:
                 elif isinstance(item, FusionBarrier):
                     instr = item.raw_instr
                     info = tile_info.get(instr.dst) if instr.dst else None
+                    if instr.opcode in ("MSCATTER", "SCATTER_UPDATE") and instr.operands:
+                        info = tile_info.get(instr.operands[0]) or info
                     # Use standard tile size defaults for CUDA
                     rows = info.rows if info else 32
                     cols = info.cols if info else 128
@@ -4686,6 +5116,8 @@ class MultiBackendCodeGenerator:
                 elif isinstance(item, FusionBarrier):
                     instr = item.raw_instr
                     info = tile_info.get(instr.dst) if instr.dst else None
+                    if instr.opcode in ("MSCATTER", "SCATTER_UPDATE") and instr.operands:
+                        info = tile_info.get(instr.operands[0]) or info
                     # Use standard tile size defaults for Ascend
                     rows = info.rows if info else 32
                     cols = info.cols if info else 128
@@ -5267,6 +5699,25 @@ class MultiBackendCodeGenerator:
                 r0 = _get_operand_str(instr.r0)
                 r1 = _get_operand_str(instr.r1)
                 _emit(f"TEXTRACT({instr.dst.name}, {instr.src.name}, (uint16_t)({r0}), (uint16_t)({r1}));")
+            elif op == "TCONCAT":
+                # pto-isa 无 TCONCAT 原语，用 C 循环实现；TINSERT 为 Acc->Mat 无法直接用于 Mat 拼接
+                axis = getattr(instr, "axis", 1)
+                d = program.tile_declarations.get(instr.dst.name)
+                a = program.tile_declarations.get(instr.src_left.name)
+                b = program.tile_declarations.get(instr.src_right.name)
+                rows = d.shape.rows if d else 8
+                cols = d.shape.cols if d else 8
+                r1 = a.shape.rows if a else (rows // 2 if axis == 0 else rows)
+                c1 = a.shape.cols if a else (cols // 2 if axis == 1 else cols)
+                r2 = b.shape.rows if b else (rows - r1 if axis == 0 else rows)
+                c2 = b.shape.cols if b else (cols - c1 if axis == 1 else cols)
+                if axis == 0:
+                    _emit(f"// TCONCAT(axis=0): {instr.dst.name} = [ {instr.src_left.name}; {instr.src_right.name} ]")
+                    _emit(f"for (int _r = 0; _r < {r1}; _r++) for (int _c = 0; _c < {cols}; _c++) {instr.dst.name}[_r][_c] = {instr.src_left.name}[_r][_c];")
+                    _emit(f"for (int _r = 0; _r < {r2}; _r++) for (int _c = 0; _c < {cols}; _c++) {instr.dst.name}[{r1} + _r][_c] = {instr.src_right.name}[_r][_c];")
+                else:
+                    _emit(f"// TCONCAT(axis=1): {instr.dst.name} = [ {instr.src_left.name} | {instr.src_right.name} ]")
+                    _emit(f"for (int _r = 0; _r < {rows}; _r++) {{ for (int _c = 0; _c < {c1}; _c++) {instr.dst.name}[_r][_c] = {instr.src_left.name}[_r][_c]; for (int _c = 0; _c < {c2}; _c++) {instr.dst.name}[_r][{c1} + _c] = {instr.src_right.name}[_r][_c]; }}")
             elif op in ("TGATHER", "TGATHERB", "TSCATTER"):
                 if op == "TGATHER":
                     _emit(f"TGATHER({instr.dst.name}, {instr.src.name}, {instr.indices.name});")
@@ -5274,6 +5725,16 @@ class MultiBackendCodeGenerator:
                     _emit(f"TGATHERB({instr.dst.name}, {instr.src.name}, {instr.offsets.name});")
                 else:
                     _emit(f"TSCATTER({instr.dst.name}, {instr.src.name}, {instr.idx.name});")
+            elif op == "MSCATTER":
+                _emit(f"MSCATTER({instr.mem.name}, {instr.src.name}, {instr.idx.name});")
+            elif op == "SCATTER_UPDATE":
+                _r = instr.src.tile_type.shape.rows
+                _c = instr.src.tile_type.shape.cols
+                _emit(f"for (int _i = 0; _i < {_r}; _i++) {{")
+                _emit(f"  int _row = (int){instr.row_indices.name}[_i][0];")
+                _emit(f"  for (int _j = 0; _j < {_c}; _j++) {{")
+                _emit(f"    {instr.dst_mem.name}[_row * {_c} + _j] = {instr.src.name}[_i][_j];")
+                _emit(f"  }}}}")
             elif op == "TCVT":
                 mode = getattr(instr, "rmode", None)
                 round_map = {
