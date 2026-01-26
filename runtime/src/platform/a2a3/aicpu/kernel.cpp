@@ -4,7 +4,6 @@
 #include <sched.h>
 #include "device_log.h"
 #include "graph.h"
-#include "handshake.h"
 #include "kernel_args.h"
 
 // Static atomic counter for thread indexing

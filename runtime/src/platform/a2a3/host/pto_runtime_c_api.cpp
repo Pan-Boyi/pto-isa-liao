@@ -46,7 +46,7 @@ int ValidateGraph(GraphHandle graph) {
 /* DeviceRunner API Implementation */
 /* =========================================================================== */
 
-int DeviceRunner_Init(int device_id, int num_cores,
+int DeviceRunner_Init(int device_id,
                       const uint8_t* aicpu_binary, size_t aicpu_size,
                       const uint8_t* aicore_binary, size_t aicore_size,
                       const char* pto_isa_root) {
@@ -58,29 +58,33 @@ int DeviceRunner_Init(int device_id, int num_cores,
         DeviceRunner& runner = DeviceRunner::Get();
         std::vector<uint8_t> aicpuVec(aicpu_binary, aicpu_binary + aicpu_size);
         std::vector<uint8_t> aicoreVec(aicore_binary, aicore_binary + aicore_size);
-        return runner.Init(device_id, num_cores, aicpuVec, aicoreVec, std::string(pto_isa_root));
+        return runner.Init(device_id, aicpuVec, aicoreVec, std::string(pto_isa_root));
     } catch (...) {
         return -1;
     }
 }
 
-int DeviceRunner_Run(GraphHandle graph, int launch_aicpu_num) {
+int DeviceRunner_Run(GraphHandle graph, int num_cores, int launch_aicpu_num) {
     if (graph == NULL) {
         return -1;
     }
     try {
         DeviceRunner& runner = DeviceRunner::Get();
         Graph* g = static_cast<Graph*>(graph);
-        return runner.Run(*g, launch_aicpu_num);
+        return runner.Run(*g, num_cores, launch_aicpu_num);
     } catch (...) {
         return -1;
     }
 }
 
-void DeviceRunner_PrintHandshakeResults(void) {
+void DeviceRunner_PrintHandshakeResults(GraphHandle graph) {
+    if (graph == NULL) {
+        return;
+    }
     try {
         DeviceRunner& runner = DeviceRunner::Get();
-        runner.PrintHandshakeResults();
+        Graph* g = static_cast<Graph*>(graph);
+        runner.PrintHandshakeResults(*g);
     } catch (...) {
         // Silently ignore errors on print
     }

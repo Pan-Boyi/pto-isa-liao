@@ -14,8 +14,10 @@
 Graph::Graph() {
     // Zero-initialize all arrays
     memset(tasks, 0, sizeof(tasks));
+    memset(workers, 0, sizeof(workers));
     next_task_id = 0;
     initial_ready_count = 0;
+    worker_count = 0;
 }
 
 // =============================================================================

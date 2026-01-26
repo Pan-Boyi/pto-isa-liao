@@ -1,7 +1,6 @@
 #include <cstdint>
 #include "device_log.h"
 #include "graph.h"
-#include "handshake.h"
 
 /**
  * Execute task graph using polling-based dispatch to AICore

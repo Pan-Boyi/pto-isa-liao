@@ -20,7 +20,6 @@
 #include <vector>
 #include <runtime/rt.h>
 #include "kernel_args.h"
-#include "handshake.h"
 #include "memoryallocator.h"
 #include "function_cache.h"
 
@@ -153,13 +152,12 @@ public:
      * Must be called before any other operations.
      *
      * @param deviceId            Device ID (0-15)
-     * @param numCores            Number of cores for handshake (e.g., 3 for 1c2v)
      * @param aicpuSoBinary       Binary data of AICPU shared object
      * @param aicoreKernelBinary  Binary data of AICore kernel
      * @param ptoIsaRoot          Path to PTO-ISA root directory (headers location)
      * @return 0 on success, error code on failure
      */
-    int Init(int deviceId, int numCores, const std::vector<uint8_t>& aicpuSoBinary,
+    int Init(int deviceId, const std::vector<uint8_t>& aicpuSoBinary,
              const std::vector<uint8_t>& aicoreKernelBinary, const std::string& ptoIsaRoot);
 
     /**
@@ -201,25 +199,30 @@ public:
      * Execute a graph
      *
      * This method:
-     * 1. Transfers graph to device memory
-     * 2. Launches AICPU init kernel
-     * 3. Launches AICPU main kernel
-     * 4. Launches AICore kernel
-     * 5. Synchronizes streams
-     * 6. Cleans up graph memory
+     * 1. Initializes worker handshake buffers in the graph based on numCores
+     * 2. Transfers graph to device memory
+     * 3. Launches AICPU init kernel
+     * 4. Launches AICPU main kernel
+     * 5. Launches AICore kernel
+     * 6. Synchronizes streams
+     * 7. Cleans up graph memory
      *
-     * @param graph          Graph to execute
+     * @param graph          Graph to execute (will be modified to initialize workers)
+     * @param numCores       Number of cores for handshake (e.g., 3 for 1c2v)
      * @param launchAicpuNum Number of AICPU instances (default: 1)
      * @return 0 on success, error code on failure
      */
-    int Run(const Graph& graph, int launchAicpuNum = 1);
+    int Run(Graph& graph, int numCores, int launchAicpuNum = 1);
 
     /**
      * Print handshake results from device
      *
      * Copies handshake buffers from device and prints their status.
+     * Must be called after Run() with the same graph.
+     *
+     * @param graph  The graph whose handshake results should be printed
      */
-    void PrintHandshakeResults();
+    void PrintHandshakeResults(Graph& graph);
 
     /**
      * Cleanup all resources
@@ -351,9 +354,6 @@ private:
     AicpuSoInfo soInfo_;
     KernelArgsHelper kernelArgs_;
     DeviceArgs deviceArgs_;
-
-    // Handshake buffers
-    std::vector<Handshake> hankArgs_;
 
     // Kernel binary management (NEW - for runtime function pointer dispatch)
     CoreFunctionBinCache* binCache_{nullptr};         // Host-side cache structure

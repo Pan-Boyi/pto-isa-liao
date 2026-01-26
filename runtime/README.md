@@ -136,7 +136,6 @@ runtime/
 │   ├── aicore/                      # AICore kernel (device program)
 │   │   └── kernel.cpp              # Task execution kernels
 │   └── common/                      # Shared structures
-│       ├── handshake.h              # AICPU-AICore handshake protocol
 │       └── kernel_args.h            # Kernel argument structures
 │
 ├── python/                          # Language bindings
@@ -149,7 +148,7 @@ runtime/
 │   ├── host/graphmaker.cpp          # C++ graph builder & validator
 │   ├── aicpu/execute.cpp            # Example scheduler
 │   ├── graph/                       # Task graph definitions
-│   │   ├── graph.h/cpp
+│   │   ├── graph.h/cpp              # Task graph and handshake structures
 │   │   └── kernel_args.h
 │   └── kernels/aiv/                 # Example kernels
 │       ├── kernel_add.cpp

@@ -56,7 +56,7 @@ class BinaryCompiler:
         if not os.path.isfile(ld_path):
             raise FileNotFoundError(f"Linker not found: {ld_path}")
 
-        aicore_dir = Path(__file__).parent.parent / "src" / "aicore"
+        aicore_dir = Path(__file__).parent.parent / "src" / "platform" / "a2a3" / "aicore"
 
         return AICoreToolchain(cc=cc_path, ld=ld_path, aicore_dir=str(aicore_dir))
 
@@ -79,7 +79,7 @@ class BinaryCompiler:
         if not os.path.isfile(cxx_path):
             raise FileNotFoundError(f"AICPU C++ compiler not found: {cxx_path}")
 
-        aicpu_dir = Path(__file__).parent.parent / "src" / "aicpu"
+        aicpu_dir = Path(__file__).parent.parent / "src" / "platform" / "a2a3" / "aicpu"
 
         return AICPUToolchain(cc=cc_path, cxx=cxx_path, aicpu_dir=str(aicpu_dir), ascend_home_path=self.ascend_home_path)
 
@@ -107,7 +107,7 @@ class BinaryCompiler:
                 "Please install g++."
             )
 
-        host_dir = Path(__file__).parent.parent / "src" / "host"
+        host_dir = Path(__file__).parent.parent / "src" / "platform" / "a2a3" / "host"
 
         return HostToolchain(cc=cc_path, cxx=cxx_path, host_dir=str(host_dir), ascend_home_path=self.ascend_home_path)
 

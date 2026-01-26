@@ -273,7 +273,7 @@ int ValidateGraphImpl(Graph *graph) {
     }
 
     // Print handshake results
-    runner.PrintHandshakeResults();
+    runner.PrintHandshakeResults(*graph);
 
     // Cleanup
     std::cout << "\n=== Cleaning Up ===" << '\n';

@@ -133,7 +133,7 @@ DeviceRunner &DeviceRunner::Get() {
     return runner;
 }
 
-int DeviceRunner::Init(int deviceId, int numCores, const std::vector<uint8_t>& aicpuSoBinary,
+int DeviceRunner::Init(int deviceId, const std::vector<uint8_t>& aicpuSoBinary,
                        const std::vector<uint8_t>& aicoreKernelBinary, const std::string& ptoIsaRoot) {
     if (initialized_) {
         std::cerr << "Error: DeviceRunner already initialized\n";
@@ -141,7 +141,6 @@ int DeviceRunner::Init(int deviceId, int numCores, const std::vector<uint8_t>& a
     }
 
     deviceId_ = deviceId;
-    numCores_ = numCores;
     aicoreKernelBinary_ = aicoreKernelBinary;
     ptoIsaRoot_ = ptoIsaRoot;
 
@@ -200,61 +199,18 @@ int DeviceRunner::Init(int deviceId, int numCores, const std::vector<uint8_t>& a
     }
 
     // Initialize handshake buffers
-    hankArgs_.resize(numCores);
-
-    // Calculate number of AIC cores (1/3 of total)
-    int numAic = (numCores + 2) / 3;  // Round up for 1/3
-
-    for (int i = 0; i < numCores; i++) {
-        hankArgs_[i].aicpu_ready = 0;
-        hankArgs_[i].aicore_done = 0;
-        hankArgs_[i].control = 0;
-        hankArgs_[i].task = 0;
-        hankArgs_[i].task_status = 0;
-        // Set core type: first 1/3 are AIC (0), remaining 2/3 are AIV (1)
-        hankArgs_[i].core_type = (i < numAic) ? 0 : 1;
-    }
-
-    // Allocate and copy handshake to device
-    size_t total_size = sizeof(Handshake) * numCores;
-    void *hankDev = memAlloc_.Alloc(total_size);
-    if (hankDev == nullptr) {
-        std::cerr << "Error: Alloc for handshake failed\n";
-        kernelArgs_.FinalizeDeviceArgs();
-        soInfo_.Finalize();
-        rtStreamDestroy(streamAicpu_);
-        rtStreamDestroy(streamAicore_);
-        streamAicpu_ = nullptr;
-        streamAicore_ = nullptr;
-        return -1;
-    }
-
-    rc = rtMemcpy(hankDev, total_size, hankArgs_.data(), total_size, RT_MEMCPY_HOST_TO_DEVICE);
-    if (rc != 0) {
-        std::cerr << "Error: rtMemcpy for handshake failed: " << rc << '\n';
-        memAlloc_.Free(hankDev);
-        kernelArgs_.FinalizeDeviceArgs();
-        soInfo_.Finalize();
-        rtStreamDestroy(streamAicpu_);
-        rtStreamDestroy(streamAicore_);
-        streamAicpu_ = nullptr;
-        streamAicore_ = nullptr;
-        return rc;
-    }
-
-    kernelArgs_.args.hankArgs = reinterpret_cast<int64_t *>(hankDev);
-    kernelArgs_.args.core_num = numCores;
+    // NOTE: Moved to Run() to initialize per Graph instance with numCores parameter
 
     // NOTE: Kernel registration and loading moved to runtime compilation
     // Users should call Init() with ptoIsaRoot, then compile kernels:
     // Example:
-    //   runner.Init(0, 3, aicpuBinary, aicoreBinary, "/path/to/pto-isa");
+    //   runner.Init(0, aicpuBinary, aicoreBinary, "/path/to/pto-isa");
     //   runner.CompileAndLoadKernel(0, "./aicore/kernels/kernel_add.cpp", 1);
     //   runner.CompileAndLoadKernel(1, "./aicore/kernels/kernel_add_scalar.cpp", 1);
     //   runner.CompileAndLoadKernel(2, "./aicore/kernels/kernel_mul.cpp", 1);
 
     initialized_ = true;
-    std::cout << "DeviceRunner initialized: device=" << deviceId << ", cores=" << numCores << '\n';
+    std::cout << "DeviceRunner initialized: device=" << deviceId << '\n';
     return 0;
 }
 
@@ -289,19 +245,58 @@ int DeviceRunner::CopyFromDevice(void* hostPtr, const void* devPtr, size_t bytes
     return rtMemcpy(hostPtr, bytes, devPtr, bytes, RT_MEMCPY_DEVICE_TO_HOST);
 }
 
-int DeviceRunner::Run(const Graph& graph, int launchAicpuNum) {
+int DeviceRunner::Run(Graph& graph, int numCores, int launchAicpuNum) {
     if (!initialized_) {
         std::cerr << "Error: DeviceRunner not initialized\n";
         return -1;
     }
 
-    // Create a mutable copy of the graph to set functionBinAddr
-    Graph mutableGraph = graph;
+    // Initialize handshake buffers in graph
+    if (numCores > GRAPH_MAX_WORKER) {
+        std::cerr << "Error: numCores (" << numCores << ") exceeds GRAPH_MAX_WORKER (" << GRAPH_MAX_WORKER << ")\n";
+        return -1;
+    }
+
+    graph.worker_count = numCores;
+
+    // Calculate number of AIC cores (1/3 of total)
+    int numAic = (numCores + 2) / 3;  // Round up for 1/3
+
+    for (int i = 0; i < numCores; i++) {
+        graph.workers[i].aicpu_ready = 0;
+        graph.workers[i].aicore_done = 0;
+        graph.workers[i].control = 0;
+        graph.workers[i].task = 0;
+        graph.workers[i].task_status = 0;
+        // Set core type: first 1/3 are AIC (0), remaining 2/3 are AIV (1)
+        graph.workers[i].core_type = (i < numAic) ? 0 : 1;
+    }
+
+    // Allocate and copy handshake to device
+    size_t total_size = sizeof(Handshake) * numCores;
+    void *hankDev = memAlloc_.Alloc(total_size);
+    if (hankDev == nullptr) {
+        std::cerr << "Error: Alloc for handshake failed\n";
+        return -1;
+    }
+
+    int rc = rtMemcpy(hankDev, total_size, graph.workers, total_size, RT_MEMCPY_HOST_TO_DEVICE);
+    if (rc != 0) {
+        std::cerr << "Error: rtMemcpy for handshake failed: " << rc << '\n';
+        memAlloc_.Free(hankDev);
+        return rc;
+    }
+
+    kernelArgs_.args.hankArgs = reinterpret_cast<int64_t *>(hankDev);
+    kernelArgs_.args.core_num = numCores;
+
+    // Create a mutable reference to the graph for setting functionBinAddr
+    // (no longer need to create a copy since graph is already non-const)
 
     // Set functionBinAddr for all tasks (NEW - Runtime function pointer dispatch)
     std::cout << "\n=== Setting functionBinAddr for Tasks ===" << '\n';
-    for (int i = 0; i < mutableGraph.get_task_count(); i++) {
-        Task* task = mutableGraph.get_task(i);
+    for (int i = 0; i < graph.get_task_count(); i++) {
+        Task* task = graph.get_task(i);
         if (task != nullptr) {
             uint64_t addr = GetFunctionBinAddr(task->func_id);
             task->functionBinAddr = addr;
@@ -312,7 +307,7 @@ int DeviceRunner::Run(const Graph& graph, int launchAicpuNum) {
     std::cout << '\n';
 
     // Initialize graph args
-    int rc = kernelArgs_.InitGraphArgs(mutableGraph, memAlloc_);
+    rc = kernelArgs_.InitGraphArgs(graph, memAlloc_);
     if (rc != 0) {
         std::cerr << "Error: InitGraphArgs failed: " << rc << '\n';
         return rc;
@@ -363,20 +358,20 @@ int DeviceRunner::Run(const Graph& graph, int launchAicpuNum) {
     return 0;
 }
 
-void DeviceRunner::PrintHandshakeResults() {
-    if (!initialized_ || hankArgs_.empty()) {
+void DeviceRunner::PrintHandshakeResults(Graph& graph) {
+    if (!initialized_ || graph.worker_count == 0) {
         return;
     }
 
-    size_t total_size = sizeof(Handshake) * numCores_;
-    rtMemcpy(hankArgs_.data(), total_size, kernelArgs_.args.hankArgs, total_size, RT_MEMCPY_DEVICE_TO_HOST);
+    size_t total_size = sizeof(Handshake) * graph.worker_count;
+    rtMemcpy(graph.workers, total_size, kernelArgs_.args.hankArgs, total_size, RT_MEMCPY_DEVICE_TO_HOST);
 
-    std::cout << "Handshake results for " << numCores_ << " cores:" << std::endl;
-    for (int i = 0; i < numCores_; i++) {
-        std::cout << "  Core " << i << ": aicore_done=" << hankArgs_[i].aicore_done
-                  << " aicpu_ready=" << hankArgs_[i].aicpu_ready
-                  << " control=" << hankArgs_[i].control
-                  << " task=" << hankArgs_[i].task << std::endl;
+    std::cout << "Handshake results for " << graph.worker_count << " cores:" << std::endl;
+    for (int i = 0; i < graph.worker_count; i++) {
+        std::cout << "  Core " << i << ": aicore_done=" << graph.workers[i].aicore_done
+                  << " aicpu_ready=" << graph.workers[i].aicpu_ready
+                  << " control=" << graph.workers[i].control
+                  << " task=" << graph.workers[i].task << std::endl;
     }
 }
 
@@ -415,9 +410,7 @@ int DeviceRunner::Finalize() {
 
     initialized_ = false;
     deviceId_ = -1;
-    numCores_ = 0;
     aicoreKernelBinary_.clear();
-    hankArgs_.clear();
 
     std::cout << "DeviceRunner finalized\n";
     return 0;

@@ -22,7 +22,7 @@ import numpy as np
 
 # Add parent directory to path so we can import runtime_bindings
 example_root = Path(__file__).parent
-runtime_root = Path(__file__).parent.parent.parent
+runtime_root = Path(__file__).parent.parent
 runtime_dir = runtime_root / "python"
 sys.path.insert(0, str(runtime_dir))
 
@@ -50,10 +50,10 @@ def check_and_build_runtime():
     print("\n[1/3] Compiling AICore kernel...")
     try:
         aicore_include_dirs = [
-            str(example_root / "graph"),
+            str(runtime_root / "src" / "runtime" / "graph"),
         ]
         aicore_source_dirs = [
-            str(example_root / "graph"),
+            str(runtime_root / "src" / "runtime" / "graph"),
         ]
         aicore_binary = compiler.compile("aicore", aicore_include_dirs, aicore_source_dirs)
     except Exception as e:
@@ -64,11 +64,11 @@ def check_and_build_runtime():
     print("\n[2/3] Compiling AICPU kernel...")
     try:
         aicpu_include_dirs = [
-            str(example_root / "graph"),
+            str(runtime_root / "src" / "runtime" / "graph"),
         ]
         aicpu_source_dirs = [
-            str(example_root / "aicpu"),
-            str(example_root / "graph"),
+            str(runtime_root / "src" / "runtime" / "aicpu"),
+            str(runtime_root / "src" / "runtime" / "graph"),
         ]
         aicpu_binary = compiler.compile("aicpu", aicpu_include_dirs, aicpu_source_dirs)
     except Exception as e:
@@ -79,11 +79,11 @@ def check_and_build_runtime():
     print("\n[3/3] Compiling Host runtime...")
     try:
         host_include_dirs = [
-            str(example_root / "graph"),
+            str(runtime_root / "src" / "runtime" / "graph"),
         ]
         host_source_dirs = [
-            str(example_root / "host"),
-            str(example_root / "graph"),
+            str(runtime_root / "src" / "runtime" / "host"),
+            str(runtime_root / "src" / "runtime" / "graph"),
         ]
         host_binary = compiler.compile("host", host_include_dirs, host_source_dirs)
     except Exception as e:
@@ -118,9 +118,6 @@ def main():
 
     pto_isa_root = "/data/wcwxy/workspace/pypto/pto-isa"
 
-    # Set PTO_ISA_ROOT environment variable for C++ to use
-    os.environ['PTO_ISA_ROOT'] = pto_isa_root
-
     # Load runtime library and get bindings
     print("\n=== Loading Runtime Library ===")
     DeviceRunner, Graph = load_runtime(host_binary)
@@ -129,7 +126,7 @@ def main():
     # Initialize DeviceRunner
     print("\n=== Initializing DeviceRunner ===")
     runner = DeviceRunner()
-    runner.init(device_id, 3, aicpu_binary, aicore_binary, pto_isa_root)
+    runner.init(device_id, aicpu_binary, aicore_binary, pto_isa_root)
 
     # Create and initialize graph
     # C++ handles: allocate Graph, allocate tensors, build tasks, initialize data
@@ -140,7 +137,7 @@ def main():
     # Execute graph on device
     # Python now controls when the graph is executed
     print("\n=== Executing Graph on Device ===")
-    runner.run(graph, launch_aicpu_num=1)
+    runner.run(graph, num_cores=3, launch_aicpu_num=1)
 
     # Validate results and cleanup
     # C++ handles: copy results from device, validate, free tensors, delete graph
