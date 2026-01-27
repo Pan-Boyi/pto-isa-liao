@@ -491,6 +491,13 @@ def convert_program_to_mock_instructions(program: PTOProgram) -> Tuple[Dict[str,
         elif opcode == "RETURN":
             dst = ""
             operands = instr.values if instr.values else []
+        # Handle scalar operations (TMULS, TADDS, TSUBS, TDIVS)
+        elif opcode in ("TMULS", "TADDS", "TSUBS", "TDIVS"):
+            # Scalar operations have 'src' and 'scalar' operands
+            if hasattr(instr, 'src') and hasattr(instr, 'scalar'):
+                operands = [_get_operand_str(instr.src), _get_operand_str(instr.scalar)]
+            else:
+                operands = []
         elif hasattr(instr, 'src0') and hasattr(instr, 'src1'):
             operands = [_get_operand_str(instr.src0), _get_operand_str(instr.src1)]
         elif hasattr(instr, 'src'):

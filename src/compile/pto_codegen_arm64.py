@@ -47,12 +47,14 @@ class OrchestrationContext:
     - Tensor to producer task mapping for dependency tracking
     - Module reference for InCore function metadata
     - Default tile dimensions for code generation
+    - Current program being generated (for memref dimension lookup)
     """
     module: Optional['PTOModule'] = None
     task_counter: int = 0
     tensor_producers: Dict[str, int] = field(default_factory=dict)
     default_tile_rows: int = 32
     default_tile_cols: int = 128
+    current_program: Optional['PTOProgram'] = None
     
     def alloc_task(self) -> int:
         """Allocate a new task ID."""
@@ -81,7 +83,8 @@ class OrchestrationContext:
 
 def gen_arm64_barrier_op(instr: MockInstruction, rows: int, cols: int, dtype: str, 
                          tile_info: Dict[str, MockTileInfo],
-                         orch_ctx: Optional[OrchestrationContext] = None) -> List[str]:
+                         orch_ctx: Optional[OrchestrationContext] = None,
+                         scalar_declarations: Optional[Dict[str, Any]] = None) -> List[str]:
     """
     Generate ARM64 code for barrier operations (non-fusable).
     
@@ -116,13 +119,22 @@ def gen_arm64_barrier_op(instr: MockInstruction, rows: int, cols: int, dtype: st
         col_off = instr.operands[2] if len(instr.operands) > 2 else "0"
         row_offset_expr = f"({row_off}) * {rows}" if row_off != "0" else "0"
         col_offset_expr = col_off if col_off != "0" else "0"
+        
+        # For TSTORE, use destination memref's actual stride, not source tile's cols
+        # Get destination memref stride from memref_declarations if available
+        dst_stride = cols  # Default to source tile cols
+        if orch_ctx and orch_ctx.current_program and dst_mem in orch_ctx.current_program.memref_declarations:
+            memref_type = orch_ctx.current_program.memref_declarations[dst_mem]
+            if memref_type.shape:
+                dst_stride = memref_type.shape.cols  # Use memref's actual column dimension as stride
+        
         lines.append(f"// TSTORE: store({src}) -> {dst_mem}[{row_off}, {col_off}]")
         lines.append(f"for (int _row = 0; _row < {rows}; _row++) {{")
         lines.append(f"    for (int _col = 0; _col < {cols}; _col++) {{")
         if row_off == "0" and col_off == "0":
-            lines.append(f"        {dst_mem}[_row * {cols} + _col] = {src}[_row][_col];")
+            lines.append(f"        {dst_mem}[_row * {dst_stride} + _col] = {src}[_row][_col];")
         else:
-            lines.append(f"        {dst_mem}[({row_offset_expr} + _row) * {cols} + {col_offset_expr} + _col] = {src}[_row][_col];")
+            lines.append(f"        {dst_mem}[({row_offset_expr} + _row) * {dst_stride} + {col_offset_expr} + _col] = {src}[_row][_col];")
         lines.append(f"    }}}}")
         
     elif instr.opcode == "TROWSUM":
@@ -184,6 +196,19 @@ def gen_arm64_barrier_op(instr: MockInstruction, rows: int, cols: int, dtype: st
         lines.append(f"            _sum += {a}[_i][_k] * {b}[_k][_j];}}")
         lines.append(f"        {dst}[_i][_j] = _sum;}}}}")
     
+    elif instr.opcode == "TTRANS":
+        dst, src = instr.dst, instr.operands[0]
+        src_info = tile_info.get(src)
+        src_rows = src_info.rows if src_info else rows
+        src_cols = src_info.cols if src_info else cols
+        # TTRANS: dst = transpose(src)
+        # For transpose, dst dimensions are swapped: dst[rows, cols] = src[cols, rows]
+        lines.append(f"// TTRANS: {dst} = transpose({src})")
+        lines.append(f"for (int _row = 0; _row < {rows}; _row++) {{")
+        lines.append(f"    for (int _col = 0; _col < {cols}; _col++) {{")
+        lines.append(f"        {dst}[_row][_col] = {src}[_col][_row];")
+        lines.append(f"    }}}}")
+    
     # =========== Control Flow Instructions ===========
     elif instr.opcode == "FOR":
         iv = instr.dst
@@ -230,7 +255,31 @@ def gen_arm64_barrier_op(instr: MockInstruction, rows: int, cols: int, dtype: st
     elif instr.opcode == "SLI":
         dst = instr.dst
         imm = instr.operands[0]
-        lines.append(f"int {dst} = {imm};")
+        # Determine scalar type from program declarations or infer from value
+        scalar_type = "float"  # Default to float for FP32 scalars
+        if scalar_declarations and dst in scalar_declarations:
+            elem_type = scalar_declarations[dst]
+            scalar_type = ARM64_TYPE_MAP.get(elem_type.value, "float")
+        else:
+            # Infer type from immediate value
+            imm_str = str(imm)
+            if '.' in imm_str or 'e' in imm_str.lower() or 'E' in imm_str:
+                scalar_type = "float"
+                # Add 'f' suffix for float literals if not already present
+                if imm_str.replace('.', '').replace('-', '').replace('e', '').replace('E', '').replace('+', '').replace('f', '').isdigit():
+                    imm = f"{imm_str}f" if not imm_str.endswith('f') else imm_str
+            else:
+                # Try to parse as number
+                try:
+                    float_val = float(imm_str)
+                    if float_val != int(float_val):
+                        scalar_type = "float"
+                        imm = f"{imm_str}f"
+                    else:
+                        scalar_type = "int"
+                except:
+                    scalar_type = "float"
+        lines.append(f"{scalar_type} {dst} = {imm};")
         
     elif instr.opcode == "SCMP":
         dst = instr.dst
@@ -337,23 +386,51 @@ def gen_task_scheduling_code(callee: str, args: Union[List, Dict],
         for param, arg_value in args.items():
             is_output = "output" in param.lower() or "result" in param.lower() or "dst" in param.lower()
             
-            info = tile_info.get(str(arg_value) if not isinstance(arg_value, tuple) else arg_value[0])
-            t_rows = info.rows if info else rows
-            t_cols = info.cols if info else cols
-            
+            # Extract tensor name from arg_value
             if isinstance(arg_value, tuple):
                 tensor_name = arg_value[0]
-                row_off = str(arg_value[1]) if len(arg_value) > 1 else "0"
-                col_off = str(arg_value[2]) if len(arg_value) > 2 else "0"
             elif isinstance(arg_value, str) and "->" in arg_value:
-                parts = arg_value.split("->")
-                tensor_name = parts[0].strip()
-                row_off = "0"
-                col_off = "0"
+                tensor_name = arg_value.split("->")[0].strip()
             else:
                 tensor_name = str(arg_value)
+            
+            # Extract row/col offsets
+            if isinstance(arg_value, tuple):
+                row_off = str(arg_value[1]) if len(arg_value) > 1 else "0"
+                col_off = str(arg_value[2]) if len(arg_value) > 2 else "0"
+            else:
                 row_off = "0"
                 col_off = "0"
+            
+            # Try to get dimensions from current program's memref_declarations first
+            t_rows = rows
+            t_cols = cols
+            if orch_ctx.current_program and tensor_name in orch_ctx.current_program.memref_declarations:
+                memref_type = orch_ctx.current_program.memref_declarations[tensor_name]
+                if memref_type.shape:
+                    t_rows = memref_type.shape.rows
+                    t_cols = memref_type.shape.cols
+            else:
+                # Fallback to tile_info (for tile operands)
+                info = tile_info.get(tensor_name)
+                if info:
+                    t_rows = info.rows
+                    t_cols = info.cols
+            
+            # Re-extract tensor_name for dimension lookup (in case it was already extracted above)
+            if isinstance(arg_value, tuple):
+                lookup_name = arg_value[0]
+            elif isinstance(arg_value, str) and "->" in arg_value:
+                lookup_name = arg_value.split("->")[0].strip()
+            else:
+                lookup_name = str(arg_value)
+            
+            # Get dimensions from current program's memref_declarations if available
+            if orch_ctx.current_program and lookup_name in orch_ctx.current_program.memref_declarations:
+                memref_type = orch_ctx.current_program.memref_declarations[lookup_name]
+                if memref_type.shape:
+                    t_rows = memref_type.shape.rows
+                    t_cols = memref_type.shape.cols
             
             if is_output:
                 output_args.append((tensor_name, row_off, col_off, t_rows, t_cols))
@@ -400,8 +477,7 @@ class ARM64FusedCodeGenerator:
             op_code = self._generate_single_op(op, c_type)
             lines.append(f"        {op_code}")
         
-        lines.append("    }}")
-        lines.append("}")
+        lines.append("    }}")  # Close inner and outer loops
         
         return lines
     
@@ -411,12 +487,21 @@ class ARM64FusedCodeGenerator:
         src0 = f"{op.operands[0]}[_row][_col]" if op.operands else ""
         src1 = ""
         
+        # Check if this is a scalar operation (second operand is a scalar, not a tile)
+        is_scalar_op = op.opcode in ("TADDS", "TSUBS", "TMULS", "TDIVS")
+        
         if len(op.operands) >= 2:
             src1_val = op.operands[1]
-            if isinstance(src1_val, str) and not src1_val.replace(".", "").replace("-", "").isdigit():
-                src1 = f"{src1_val}[_row][_col]"
-            else:
+            if is_scalar_op:
+                # For scalar operations, second operand is a scalar variable or literal
+                # Use it directly without indexing
                 src1 = str(src1_val)
+            else:
+                # For tile operations, check if it's a tile or literal
+                if isinstance(src1_val, str) and not src1_val.replace(".", "").replace("-", "").isdigit():
+                    src1 = f"{src1_val}[_row][_col]"
+                else:
+                    src1 = str(src1_val)
         
         # Binary operations
         if op.opcode == "TADD": return f"{dst} = {src0} + {src1};"
@@ -480,7 +565,7 @@ class ARM64CodeGenerator:
         # Create orchestration context for non-InCore functions
         orch_ctx = None
         if not is_in_core:
-            orch_ctx = OrchestrationContext(module=self.module)
+            orch_ctx = OrchestrationContext(module=self.module, current_program=program)
         
         lines = [
             f"// PTO Program: {program.name}",
@@ -501,7 +586,7 @@ class ARM64CodeGenerator:
         if not is_in_core:
             lines.append('// Orchestration function - builds task graph using PTO runtime')
             lines.append('#include "pto_runtime.h"')
-            lines.append('#include "pto_runtime.c"  // Include for standalone build')
+            lines.append('// Note: pto_runtime.c should be compiled separately to avoid duplicate symbols')
             lines.append('#include <string.h>  // For strcmp in main')
             lines.append('#include <time.h>    // For benchmark timing')
             lines.append('')
@@ -567,7 +652,13 @@ class ARM64CodeGenerator:
                     lines.append("")
                 elif isinstance(item, FusionBarrier):
                     instr = item.raw_instr
-                    info = tile_info.get(instr.dst) if instr.dst else None
+                    # For TSTORE, get dimensions from source tile (operands[0]), not destination memref (dst)
+                    # For other operations, get dimensions from destination tile (dst)
+                    if instr.opcode == "TSTORE" and instr.operands:
+                        src_tile = instr.operands[0]
+                        info = tile_info.get(src_tile) if src_tile else None
+                    else:
+                        info = tile_info.get(instr.dst) if instr.dst else None
                     default_rows = orch_ctx.default_tile_rows if orch_ctx else 32
                     default_cols = orch_ctx.default_tile_cols if orch_ctx else 128
                     rows = info.rows if info else default_rows
@@ -581,7 +672,7 @@ class ARM64CodeGenerator:
                     elif instr.opcode == "ELSE":
                         indent = "    " * max(1, indent_level - 1)
                     
-                    barrier_lines = gen_arm64_barrier_op(instr, rows, cols, dtype, tile_info, orch_ctx)
+                    barrier_lines = gen_arm64_barrier_op(instr, rows, cols, dtype, tile_info, orch_ctx, program.scalar_declarations)
                     for barrier_line in barrier_lines:
                         lines.append(f"{indent}{barrier_line}" if barrier_line else "")
                     
