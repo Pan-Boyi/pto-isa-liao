@@ -5,13 +5,13 @@
  * Vector and Cube core execution on Ascend A2/A3 NPU.
  */
 
-// POSIX definitions must come before any includes
+// POSIX definitions must come FIRST, before ANY includes
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 199309L
 #endif
 
+#include <time.h>  // Must be after _POSIX_C_SOURCE for clock_gettime
 #include "a2a3_orchestration.h"
-#include <time.h>
 
 // =============================================================================
 // Dual Ready Queue Implementation

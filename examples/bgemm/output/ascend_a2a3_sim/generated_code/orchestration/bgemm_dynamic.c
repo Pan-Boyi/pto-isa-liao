@@ -5,12 +5,19 @@
 // InCore functions contain actual Ascend instructions that are parsed and
 // simulated by the core model.
 
+// POSIX definitions must come FIRST, before ANY system includes
+// This enables clock_gettime, nanosleep, etc.
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 199309L
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 
 // Enable A2A3 platform for dual-queue simulation
 #define PTO_PLATFORM_A2A3
@@ -84,169 +91,72 @@ int64_t get_incore_cycle_cost_sim(const char* func_name, int64_t tile_size) {
 // Orchestration Function: bgemm_dynamic
 // Generates task graph for Ascend A2/A3 cycle-accurate simulation
 // =============================================================================
+//
+// Parameters passed via void** array:
+//   [0] A (float*)
+//   [1] B (float*)
+//   [2] C (float*)
+//   [3] P (float*)
+//   [4] b (int32_t)
+//   [5] m (int32_t)
+//   [6] k (int32_t)
+//   [7] n (int32_t)
+// =============================================================================
 
-void bgemm_dynamic(PTORuntime* rt, float* A, float* B, float* C, float* P0, float* P1, float* P2, int32_t seq_len, int32_t tile_rows, int32_t num_tiles, float zero) {
+void bgemm_dynamic(PTORuntime* rt, void* user_data) {
+    // Unpack parameters from void** array
+    void** params = (void**)user_data;
+    (void)params;  // Suppress unused warning if no params
+
+    float* A = (float*)params[0];
+    float* B = (float*)params[1];
+    float* C = (float*)params[2];
+    float* P = (float*)params[3];
+    int32_t b = *(int32_t*)params[4];
+    int32_t m = *(int32_t*)params[5];
+    int32_t k = *(int32_t*)params[6];
+    int32_t n = *(int32_t*)params[7];
 
     int32_t _task_id = 0;
 
-    for (int tile = 0; tile < num_tiles; tile += 1) {
-        // Task: gemm_tile (Cube Core)
-        {
-            int32_t t = pto_task_alloc(rt, "gemm_tile", NULL, 0, 0, true);
-            pto_task_add_input(rt, t, A, tile * 8 + 0, 0, 64, 64);
-            pto_task_add_input(rt, t, B, 0 * num_tiles + tile, 0, 64, 128);
-            pto_task_add_output(rt, t, P0, tile * 8 + 0, 0, 64, 128);
-            // Cycle cost: 10 (heuristic), use core sim for accurate timing
-            pto_task_submit(rt, t);
-        }
+    for (int batch = 0; batch < b; batch += 1) {
+        for (int sm = 0; sm < m; sm += 4) {
+            for (int sn = 0; sn < n; sn += 4) {
+                for (int k_idx = 0; k_idx < k; k_idx += 1) {
+                    for (int lm = 0; lm < 4; lm += 1) {
+                        for (int ln = 0; ln < 4; ln += 1) {
+                            // Task: gemm_tile (Cube Core)
+                            {
+                                int32_t t = pto_task_alloc(rt, "gemm_tile", NULL, 0, 0, true);
+                                pto_task_add_input(rt, t, A, batch * (m * k) + (sm + lm) * k + k_idx, 0, 32, 128);
+                                pto_task_add_input(rt, t, B, batch * (k * n) + k_idx * n + (sn + ln), 0, 32, 128);
+                                pto_task_add_output(rt, t, P, batch * (m * n) + (sm + lm) * n + (sn + ln), 0, 32, 128);
+                                // Cycle cost: 10 (heuristic), use core sim for accurate timing
+                                pto_task_submit(rt, t);
+                            }
 
-        // Task: gemm_tile (Cube Core)
-        {
-            int32_t t = pto_task_alloc(rt, "gemm_tile", NULL, 0, 0, true);
-            pto_task_add_input(rt, t, A, tile * 8 + 1, 0, 64, 64);
-            pto_task_add_input(rt, t, B, 1 * num_tiles + tile, 0, 64, 128);
-            pto_task_add_output(rt, t, P0, tile * 8 + 1, 0, 64, 128);
-            // Cycle cost: 10 (heuristic), use core sim for accurate timing
-            pto_task_submit(rt, t);
-        }
+                            // Task: tile_add (Vector Core)
+                            {
+                                int32_t t = pto_task_alloc(rt, "tile_add", NULL, 0, 0, false);
+                                pto_task_add_input(rt, t, C, batch * (m * n) + (sm + lm) * n + (sn + ln), 0, 32, 128);
+                                pto_task_add_input(rt, t, P, batch * (m * n) + (sm + lm) * n + (sn + ln), 0, 32, 128);
+                                pto_task_add_output(rt, t, C, batch * (m * n) + (sm + lm) * n + (sn + ln), 0, 32, 128);
+                                // Cycle cost: 10 (heuristic), use core sim for accurate timing
+                                pto_task_submit(rt, t);
+                            }
 
-        // Task: gemm_tile (Cube Core)
-        {
-            int32_t t = pto_task_alloc(rt, "gemm_tile", NULL, 0, 0, true);
-            pto_task_add_input(rt, t, A, tile * 8 + 2, 0, 64, 64);
-            pto_task_add_input(rt, t, B, 2 * num_tiles + tile, 0, 64, 128);
-            pto_task_add_output(rt, t, P0, tile * 8 + 2, 0, 64, 128);
-            // Cycle cost: 10 (heuristic), use core sim for accurate timing
-            pto_task_submit(rt, t);
+                        }
+                    }
+                }
+            }
         }
-
-        // Task: gemm_tile (Cube Core)
-        {
-            int32_t t = pto_task_alloc(rt, "gemm_tile", NULL, 0, 0, true);
-            pto_task_add_input(rt, t, A, tile * 8 + 3, 0, 64, 64);
-            pto_task_add_input(rt, t, B, 3 * num_tiles + tile, 0, 64, 128);
-            pto_task_add_output(rt, t, P0, tile * 8 + 3, 0, 64, 128);
-            // Cycle cost: 10 (heuristic), use core sim for accurate timing
-            pto_task_submit(rt, t);
-        }
-
-        // Task: gemm_tile (Cube Core)
-        {
-            int32_t t = pto_task_alloc(rt, "gemm_tile", NULL, 0, 0, true);
-            pto_task_add_input(rt, t, A, tile * 8 + 4, 0, 64, 64);
-            pto_task_add_input(rt, t, B, 4 * num_tiles + tile, 0, 64, 128);
-            pto_task_add_output(rt, t, P0, tile * 8 + 4, 0, 64, 128);
-            // Cycle cost: 10 (heuristic), use core sim for accurate timing
-            pto_task_submit(rt, t);
-        }
-
-        // Task: gemm_tile (Cube Core)
-        {
-            int32_t t = pto_task_alloc(rt, "gemm_tile", NULL, 0, 0, true);
-            pto_task_add_input(rt, t, A, tile * 8 + 5, 0, 64, 64);
-            pto_task_add_input(rt, t, B, 5 * num_tiles + tile, 0, 64, 128);
-            pto_task_add_output(rt, t, P0, tile * 8 + 5, 0, 64, 128);
-            // Cycle cost: 10 (heuristic), use core sim for accurate timing
-            pto_task_submit(rt, t);
-        }
-
-        // Task: gemm_tile (Cube Core)
-        {
-            int32_t t = pto_task_alloc(rt, "gemm_tile", NULL, 0, 0, true);
-            pto_task_add_input(rt, t, A, tile * 8 + 6, 0, 64, 64);
-            pto_task_add_input(rt, t, B, 6 * num_tiles + tile, 0, 64, 128);
-            pto_task_add_output(rt, t, P0, tile * 8 + 6, 0, 64, 128);
-            // Cycle cost: 10 (heuristic), use core sim for accurate timing
-            pto_task_submit(rt, t);
-        }
-
-        // Task: gemm_tile (Cube Core)
-        {
-            int32_t t = pto_task_alloc(rt, "gemm_tile", NULL, 0, 0, true);
-            pto_task_add_input(rt, t, A, tile * 8 + 7, 0, 64, 64);
-            pto_task_add_input(rt, t, B, 7 * num_tiles + tile, 0, 64, 128);
-            pto_task_add_output(rt, t, P0, tile * 8 + 7, 0, 64, 128);
-            // Cycle cost: 10 (heuristic), use core sim for accurate timing
-            pto_task_submit(rt, t);
-        }
-
-        // Task: tile_add (Vector Core)
-        {
-            int32_t t = pto_task_alloc(rt, "tile_add", NULL, 0, 0, false);
-            pto_task_add_input(rt, t, P0, tile * 8 + 0, 0, 64, 128);
-            pto_task_add_input(rt, t, P0, tile * 8 + 1, 0, 64, 128);
-            pto_task_add_output(rt, t, P1, tile * 4 + 0, 0, 64, 128);
-            // Cycle cost: 10 (heuristic), use core sim for accurate timing
-            pto_task_submit(rt, t);
-        }
-
-        // Task: tile_add (Vector Core)
-        {
-            int32_t t = pto_task_alloc(rt, "tile_add", NULL, 0, 0, false);
-            pto_task_add_input(rt, t, P0, tile * 8 + 2, 0, 64, 128);
-            pto_task_add_input(rt, t, P0, tile * 8 + 3, 0, 64, 128);
-            pto_task_add_output(rt, t, P1, tile * 4 + 1, 0, 64, 128);
-            // Cycle cost: 10 (heuristic), use core sim for accurate timing
-            pto_task_submit(rt, t);
-        }
-
-        // Task: tile_add (Vector Core)
-        {
-            int32_t t = pto_task_alloc(rt, "tile_add", NULL, 0, 0, false);
-            pto_task_add_input(rt, t, P0, tile * 8 + 4, 0, 64, 128);
-            pto_task_add_input(rt, t, P0, tile * 8 + 5, 0, 64, 128);
-            pto_task_add_output(rt, t, P1, tile * 4 + 2, 0, 64, 128);
-            // Cycle cost: 10 (heuristic), use core sim for accurate timing
-            pto_task_submit(rt, t);
-        }
-
-        // Task: tile_add (Vector Core)
-        {
-            int32_t t = pto_task_alloc(rt, "tile_add", NULL, 0, 0, false);
-            pto_task_add_input(rt, t, P0, tile * 8 + 6, 0, 64, 128);
-            pto_task_add_input(rt, t, P0, tile * 8 + 7, 0, 64, 128);
-            pto_task_add_output(rt, t, P1, tile * 4 + 3, 0, 64, 128);
-            // Cycle cost: 10 (heuristic), use core sim for accurate timing
-            pto_task_submit(rt, t);
-        }
-
-        // Task: tile_add (Vector Core)
-        {
-            int32_t t = pto_task_alloc(rt, "tile_add", NULL, 0, 0, false);
-            pto_task_add_input(rt, t, P1, tile * 4 + 0, 0, 64, 128);
-            pto_task_add_input(rt, t, P1, tile * 4 + 1, 0, 64, 128);
-            pto_task_add_output(rt, t, P2, tile * 2 + 0, 0, 64, 128);
-            // Cycle cost: 10 (heuristic), use core sim for accurate timing
-            pto_task_submit(rt, t);
-        }
-
-        // Task: tile_add (Vector Core)
-        {
-            int32_t t = pto_task_alloc(rt, "tile_add", NULL, 0, 0, false);
-            pto_task_add_input(rt, t, P1, tile * 4 + 2, 0, 64, 128);
-            pto_task_add_input(rt, t, P1, tile * 4 + 3, 0, 64, 128);
-            pto_task_add_output(rt, t, P2, tile * 2 + 1, 0, 64, 128);
-            // Cycle cost: 10 (heuristic), use core sim for accurate timing
-            pto_task_submit(rt, t);
-        }
-
-        // Task: tile_add (Vector Core)
-        {
-            int32_t t = pto_task_alloc(rt, "tile_add", NULL, 0, 0, false);
-            pto_task_add_input(rt, t, P2, tile * 2 + 0, 0, 64, 128);
-            pto_task_add_input(rt, t, P2, tile * 2 + 1, 0, 64, 128);
-            pto_task_add_output(rt, t, C, tile, 0, 64, 128);
-            // Cycle cost: 10 (heuristic), use core sim for accurate timing
-            pto_task_submit(rt, t);
-        }
-
     }
 }
 
 // =============================================================================
 // Main Function for Cycle-Accurate Simulation
 // =============================================================================
-// Usage: bgemm_dynamic [--benchmark-only] [seq_len] [tile_rows] [num_tiles] [zero]
+// Usage: bgemm_dynamic [--benchmark-only] [b] [m] [k] [n]
 // Flags:
 //   --benchmark-only  - Only run orchestration (skip simulation), output stats
 // Environment variables:
@@ -296,24 +206,33 @@ int main(int argc, char** argv) {
     float* A = (float*)calloc(1024 * 1024, sizeof(float));
     float* B = (float*)calloc(1024 * 1024, sizeof(float));
     float* C = (float*)calloc(1024 * 1024, sizeof(float));
-    float* P0 = (float*)calloc(1024 * 1024, sizeof(float));
-    float* P1 = (float*)calloc(1024 * 1024, sizeof(float));
-    float* P2 = (float*)calloc(1024 * 1024, sizeof(float));
-    int32_t seq_len = 16;  // Default, override with argv[1]
-    int32_t tile_rows = 16;  // Default, override with argv[2]
-    int32_t num_tiles = 16;  // Default, override with argv[3]
-    float zero = 1.0f;  // Default test value
+    float* P = (float*)calloc(1024 * 1024, sizeof(float));
+    int32_t b = 16;  // Default
+    int32_t m = 16;  // Default
+    int32_t k = 16;  // Default
+    int32_t n = 16;  // Default
 
-    // Parse command line arguments for integer parameters (with offset for --benchmark-only flag)
-    if (argc > 1 + arg_offset) seq_len = atoi(argv[1 + arg_offset]);
-    if (argc > 2 + arg_offset) tile_rows = atoi(argv[2 + arg_offset]);
-    if (argc > 3 + arg_offset) num_tiles = atoi(argv[3 + arg_offset]);
-    if (argc > 4 + arg_offset) zero = atoi(argv[4 + arg_offset]);
+    // Parse command line arguments for scalar parameters (with offset for --benchmark-only flag)
+    if (argc > 1 + arg_offset) b = atoi(argv[1 + arg_offset]);
+    if (argc > 2 + arg_offset) m = atoi(argv[2 + arg_offset]);
+    if (argc > 3 + arg_offset) k = atoi(argv[3 + arg_offset]);
+    if (argc > 4 + arg_offset) n = atoi(argv[4 + arg_offset]);
+
+    // Set up parameter array (void** for orchestration function)
+    void* user_data[8];
+    user_data[0] = (void*)A;
+    user_data[1] = (void*)B;
+    user_data[2] = (void*)C;
+    user_data[3] = (void*)P;
+    user_data[4] = (void*)&b;
+    user_data[5] = (void*)&m;
+    user_data[6] = (void*)&k;
+    user_data[7] = (void*)&n;
 
     // Print configuration
     if (!benchmark_only) {
         printf("Configuration:\n");
-        printf("  num_tiles = %d\n", num_tiles);
+        printf("  b = %d\n", b);
         printf("\nPhase 1: Building task graph...\n");
     }
     
@@ -321,8 +240,8 @@ int main(int argc, char** argv) {
     struct timespec start_time, end_time;
     clock_gettime(CLOCK_MONOTONIC, &start_time);
     
-    // Call orchestration function to build task graph
-    bgemm_dynamic(rt, A, B, C, P0, P1, P2, seq_len, tile_rows, num_tiles, zero);
+    // Call orchestration function to build task graph (using void** interface)
+    bgemm_dynamic(rt, (void*)user_data);
     
     clock_gettime(CLOCK_MONOTONIC, &end_time);
     double orch_time_ms = (end_time.tv_sec - start_time.tv_sec) * 1000.0 +
@@ -334,8 +253,8 @@ int main(int argc, char** argv) {
     if (benchmark_only) {
         // Benchmark mode: just output stats in parseable format
         double tasks_per_ms = tasks_submitted / orch_time_ms;
-        printf("BENCHMARK: num_tiles=%d tasks=%lld time_ms=%.3f tasks_per_ms=%.2f\n",
-               num_tiles, (long long)tasks_submitted, orch_time_ms, tasks_per_ms);
+        printf("BENCHMARK: b=%d tasks=%lld time_ms=%.3f tasks_per_ms=%.2f\n",
+               b, (long long)tasks_submitted, orch_time_ms, tasks_per_ms);
     } else {
         printf("  Submitted %lld tasks\n", (long long)tasks_submitted);
         printf("  Orchestration time: %.3f ms (%.2f tasks/ms)\n", 
@@ -373,9 +292,7 @@ int main(int argc, char** argv) {
     free(A);
     free(B);
     free(C);
-    free(P0);
-    free(P1);
-    free(P2);
+    free(P);
     
     if (!benchmark_only) {
         printf("\n=== Simulation Complete ===\n");

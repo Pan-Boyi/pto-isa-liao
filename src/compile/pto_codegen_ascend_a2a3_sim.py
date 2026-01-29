@@ -177,12 +177,19 @@ def generate_sim_header(target_mode: str = "sim") -> str:
 // This code runs on real Ascend A2/A3 hardware using CANN SDK.
 // InCore functions contain actual Ascend instructions.
 
+// POSIX definitions must come FIRST, before ANY system includes
+// This enables clock_gettime, nanosleep, etc.
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 199309L
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 
 // Enable A2A3 platform for dual-queue execution
 #define PTO_PLATFORM_A2A3
@@ -204,12 +211,19 @@ def generate_sim_header(target_mode: str = "sim") -> str:
 // InCore functions contain actual Ascend instructions that are parsed and
 // simulated by the core model.
 
+// POSIX definitions must come FIRST, before ANY system includes
+// This enables clock_gettime, nanosleep, etc.
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 199309L
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 
 // Enable A2A3 platform for dual-queue simulation
 #define PTO_PLATFORM_A2A3
@@ -290,6 +304,7 @@ def generate_sim_main(orch_func_name: str, params: List[Tuple[str, str]]) -> str
     param_decls = []
     param_array_setup = []
     free_stmts = []
+    scalar_params = []  # Track scalar parameters for command-line parsing
     
     # Track parameters and their indices
     for i, (ptype, pname) in enumerate(params):
@@ -303,17 +318,34 @@ def generate_sim_main(orch_func_name: str, params: List[Tuple[str, str]]) -> str
             # Scalar - use default value or command line argument
             if 'int' in ptype:
                 param_decls.append(f"    {ptype} {pname} = 16;  // Default")
+                scalar_params.append((pname, 'int'))
             else:
                 param_decls.append(f"    {ptype} {pname} = 1.0f;  // Default")
+                scalar_params.append((pname, 'float'))
             param_array_setup.append(f"    user_data[{i}] = (void*)&{pname};")
     
     num_params = len(params)
+    
+    # Generate command-line argument parsing for scalar parameters
+    arg_parse_lines = []
+    for idx, (pname, ptype) in enumerate(scalar_params):
+        if ptype == 'int':
+            arg_parse_lines.append(f"    if (argc > {idx + 1} + arg_offset) {pname} = atoi(argv[{idx + 1} + arg_offset]);")
+        else:
+            arg_parse_lines.append(f"    if (argc > {idx + 1} + arg_offset) {pname} = atof(argv[{idx + 1} + arg_offset]);")
+    arg_parse_code = chr(10).join(arg_parse_lines)
+    
+    # Generate usage string with actual parameter names
+    scalar_param_names = ' '.join([f'[{pname}]' for pname, _ in scalar_params])
+    
+    # Generate configuration print for first int parameter
+    config_print_param = scalar_params[0][0] if scalar_params else "num_tiles"
     
     return f'''
 // =============================================================================
 // Main Function for Cycle-Accurate Simulation
 // =============================================================================
-// Usage: {orch_func_name} [--benchmark-only] [seq_len] [tile_rows] [num_tiles] [zero]
+// Usage: {orch_func_name} [--benchmark-only] {scalar_param_names}
 // Flags:
 //   --benchmark-only  - Only run orchestration (skip simulation), output stats
 // Environment variables:
@@ -362,11 +394,8 @@ int main(int argc, char** argv) {{
     // Allocate test data
 {chr(10).join(param_decls)}
 
-    // Parse command line arguments for integer parameters (with offset for --benchmark-only flag)
-    if (argc > 1 + arg_offset) seq_len = atoi(argv[1 + arg_offset]);
-    if (argc > 2 + arg_offset) tile_rows = atoi(argv[2 + arg_offset]);
-    if (argc > 3 + arg_offset) num_tiles = atoi(argv[3 + arg_offset]);
-    if (argc > 4 + arg_offset) zero = atoi(argv[4 + arg_offset]);
+    // Parse command line arguments for scalar parameters (with offset for --benchmark-only flag)
+{arg_parse_code}
 
     // Set up parameter array (void** for orchestration function)
     void* user_data[{num_params}];
@@ -375,7 +404,7 @@ int main(int argc, char** argv) {{
     // Print configuration
     if (!benchmark_only) {{
         printf("Configuration:\\n");
-        printf("  num_tiles = %d\\n", num_tiles);
+        printf("  {config_print_param} = %d\\n", {config_print_param});
         printf("\\nPhase 1: Building task graph...\\n");
     }}
     
@@ -396,8 +425,8 @@ int main(int argc, char** argv) {{
     if (benchmark_only) {{
         // Benchmark mode: just output stats in parseable format
         double tasks_per_ms = tasks_submitted / orch_time_ms;
-        printf("BENCHMARK: num_tiles=%d tasks=%lld time_ms=%.3f tasks_per_ms=%.2f\\n",
-               num_tiles, (long long)tasks_submitted, orch_time_ms, tasks_per_ms);
+        printf("BENCHMARK: {config_print_param}=%d tasks=%lld time_ms=%.3f tasks_per_ms=%.2f\\n",
+               {config_print_param}, (long long)tasks_submitted, orch_time_ms, tasks_per_ms);
     }} else {{
         printf("  Submitted %lld tasks\\n", (long long)tasks_submitted);
         printf("  Orchestration time: %.3f ms (%.2f tasks/ms)\\n", 

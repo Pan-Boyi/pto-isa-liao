@@ -605,11 +605,15 @@ def compile_code():
     exe_basename = os.path.basename(orch_file).replace('.c', '')
     exe_path = os.path.join(platform_dir, exe_basename)
     
-    compile_flags = ["-O2", "-std=c11"]
+    compile_flags = ["-O2", "-std=c11", "-D_POSIX_C_SOURCE=199309L"]
     if CONFIG['enable_binary_expansion']:
         compile_flags.append("-DPTO_BINARY_EXPANSION")
     if CONFIG['enable_task_dump']:
         compile_flags.append("-DPTO_TASK_DUMP")
+    
+    # Add platform-specific flags for A2A3 simulation
+    if platform == "ascend_a2a3_sim":
+        compile_flags.append("-DA2A3_TARGET_SIMULATOR")
     
     # Add include paths
     include_paths = [f"-I{{RUNTIME_DIR}}"]
@@ -1329,7 +1333,7 @@ def compile_ascend_a2a3(code_dir):
 def run_task_dump():
     """Run and collect task dump statistics."""
     if not CONFIG['enable_task_dump']:
-        return True
+        return None  # Skipped
     
     print_header("Task Dump & Statistics")
     
@@ -1414,7 +1418,7 @@ def analyze_task_dump(dump_file):
 def generate_task_graph_pdf():
     """Generate task graph visualization as PDF."""
     if not CONFIG['enable_task_graph_pdf']:
-        return True
+        return None  # Skipped
     
     print_header("Task Graph PDF Generation")
     
@@ -1473,9 +1477,9 @@ def run_performance_benchmark():
         if not run_runtime_benchmark():
             success = False
     
-    # If neither benchmark enabled, just return True
+    # If neither benchmark enabled, return None (skipped)
     if not CONFIG.get('benchmark_orchestration', False) and not CONFIG.get('benchmark_runtime', False):
-        return True
+        return None  # Skipped
     
     return success
 
@@ -1706,7 +1710,7 @@ def save_benchmark_results(platform_dir, benchmark_type, all_results):
 def run_accuracy_test():
     """Generate and run accuracy tests using Python reference implementation."""
     if not CONFIG['enable_accuracy_test']:
-        return True
+        return None  # Skipped
     
     print_header("Accuracy Test")
     
@@ -1838,7 +1842,7 @@ def run_accuracy_test():
 def run_simulation():
     """Run simulation and generate trace files."""
     if not CONFIG['enable_simulation']:
-        return True
+        return None  # Skipped
     
     print_header("Simulation & Trace Generation")
     
@@ -1934,7 +1938,12 @@ def main():
     
     print_header("Summary")
     for name, success in results:
-        status = "✓ OK" if success else "✗ FAILED"
+        if success is None:
+            status = "- SKIPPED"
+        elif success:
+            status = "✓ OK"
+        else:
+            status = "✗ FAILED"
         print(f"  {{name}}: {{status}}")
     
     print("\\nDone!")

@@ -32,9 +32,32 @@ void a2a3_core_execute_task(PTORuntime* rt, int32_t task_id, int32_t worker_id) 
         args[arg_idx++] = (void*)(base_ptr + offset);
     }
     
-    // Simulation mode: use cycle cost function for timing
-    if (rt->simulation_mode && task->cycle_func) {
-        int64_t cycle_cost = task->cycle_func(args, task->num_args);
+    // Simulation mode: use cycle cost function or heuristic for timing
+    if (rt->simulation_mode) {
+        int64_t cycle_cost;
+        
+        if (task->cycle_func) {
+            // Use provided cycle cost function
+            cycle_cost = task->cycle_func(args, task->num_args);
+        } else {
+            // Heuristic cycle estimation based on function name
+            const char* name = task->func_name;
+            if (strstr(name, "matmul") || strstr(name, "gemm")) {
+                cycle_cost = 50;  // Cube operation
+            } else if (strstr(name, "add") || strstr(name, "mul") || strstr(name, "sub")) {
+                cycle_cost = 10;  // Simple vector op
+            } else if (strstr(name, "exp") || strstr(name, "sqrt") || strstr(name, "div")) {
+                cycle_cost = 15;  // Complex vector op
+            } else if (strstr(name, "softmax") || strstr(name, "layernorm") || strstr(name, "rmsnorm")) {
+                cycle_cost = 70;  // Fused operation
+            } else if (strstr(name, "rope") || strstr(name, "attention")) {
+                cycle_cost = 60;
+            } else if (strstr(name, "copy") || strstr(name, "dma")) {
+                cycle_cost = 30;  // Memory operation
+            } else {
+                cycle_cost = 10;  // Default
+            }
+        }
         
         int64_t worker_current = pto_trace_get_cycle(worker_id);
         int64_t actual_start = (worker_current > task->earliest_start_cycle) ? 

@@ -276,7 +276,11 @@ void a2a3_pipeline_barrier(A2A3CoreContext* ctx);
 // =============================================================================
 // Include after all type definitions
 
-#if defined(A2A3_TARGET_HARDWARE)
+// Priority: A2A3_TARGET_SIMULATOR > A2A3_TARGET_HARDWARE
+// This allows command-line -DA2A3_TARGET_SIMULATOR to override source #define
+#if defined(A2A3_TARGET_SIMULATOR)
+    #include "a2a3_intrinsics_sim.h"
+#elif defined(A2A3_TARGET_HARDWARE)
     #include "a2a3_intrinsics_hw.h"
 #else
     #include "a2a3_intrinsics_sim.h"

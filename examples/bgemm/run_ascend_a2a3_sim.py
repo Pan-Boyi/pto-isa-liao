@@ -44,7 +44,7 @@ CONFIG = {
     "target_platform": "ascend_a2a3_sim",
     "enable_binary_expansion": True,
     "enable_task_dump": True,
-    "enable_task_graph_pdf": True,
+    "enable_task_graph_pdf": False,
     "benchmark_orchestration": True,  # tasks/ms without executing
     "benchmark_runtime": True,              # actual execution time
     "test_seq_len_min": 1024,
@@ -306,11 +306,15 @@ def compile_code():
     exe_basename = os.path.basename(orch_file).replace('.c', '')
     exe_path = os.path.join(platform_dir, exe_basename)
     
-    compile_flags = ["-O2", "-std=c11"]
+    compile_flags = ["-O2", "-std=c11", "-D_POSIX_C_SOURCE=199309L"]
     if CONFIG['enable_binary_expansion']:
         compile_flags.append("-DPTO_BINARY_EXPANSION")
     if CONFIG['enable_task_dump']:
         compile_flags.append("-DPTO_TASK_DUMP")
+    
+    # Add platform-specific flags for A2A3 simulation
+    if platform == "ascend_a2a3_sim":
+        compile_flags.append("-DA2A3_TARGET_SIMULATOR")
     
     # Add include paths
     include_paths = [f"-I{RUNTIME_DIR}"]
@@ -710,7 +714,7 @@ def compile_ascend_a2a3(code_dir):
     
     # 1. Compile orchestration functions to shared library
     if os.path.exists(orch_dir):
-        print("\n  [1/4] Compiling orchestration functions...")
+        print("\n  [1/7] Compiling orchestration functions...")
         c_files = glob.glob(os.path.join(orch_dir, "*.c"))
         if c_files:
             # Compile all .c files to a shared library
@@ -755,11 +759,11 @@ def compile_ascend_a2a3(code_dir):
         else:
             print("    No .c files found in orchestration/")
     else:
-        print("\n  [1/4] Skipping orchestration (no orchestration/ directory)")
+        print("\n  [1/7] Skipping orchestration (no orchestration/ directory)")
     
     # 2. Compile InCore AIC (AI Core Cube) functions
     if os.path.exists(aic_dir) and ccec_available:
-        print("\n  [2/4] Compiling InCore AIC (Cube) functions...")
+        print("\n  [2/7] Compiling InCore AIC (Cube) functions...")
         cpp_files = glob.glob(os.path.join(aic_dir, "*.cpp"))
         if cpp_files:
             for cpp_file in cpp_files:
@@ -789,13 +793,13 @@ def compile_ascend_a2a3(code_dir):
         else:
             print("    No .cpp files found in incore_aic/")
     elif not ccec_available:
-        print("\n  [2/4] Skipping InCore AIC (ccec compiler not available)")
+        print("\n  [2/7] Skipping InCore AIC (ccec compiler not available)")
     else:
-        print("\n  [2/4] Skipping InCore AIC (no incore_aic/ directory)")
+        print("\n  [2/7] Skipping InCore AIC (no incore_aic/ directory)")
     
     # 3. Compile InCore AIV (AI Core Vector) functions
     if os.path.exists(aiv_dir) and ccec_available:
-        print("\n  [3/4] Compiling InCore AIV (Vector) functions...")
+        print("\n  [3/7] Compiling InCore AIV (Vector) functions...")
         cpp_files = glob.glob(os.path.join(aiv_dir, "*.cpp"))
         if cpp_files:
             for cpp_file in cpp_files:
@@ -825,12 +829,106 @@ def compile_ascend_a2a3(code_dir):
         else:
             print("    No .cpp files found in incore_aiv/")
     elif not ccec_available:
-        print("\n  [3/4] Skipping InCore AIV (ccec compiler not available)")
+        print("\n  [3/7] Skipping InCore AIV (ccec compiler not available)")
     else:
-        print("\n  [3/4] Skipping InCore AIV (no incore_aiv/ directory)")
+        print("\n  [3/7] Skipping InCore AIV (no incore_aiv/ directory)")
     
-    # 4. Generate and compile test program
-    print("\n  [4/4] Generating and compiling test program...")
+    # 4. Link AICore kernel binary (aicore_kernel.o)
+    aicore_kernel_src = os.path.join(RUNTIME_DIR, "runtime_a2a3", "core", "aicore", "aicore_kernel.cpp")
+    common_dir = os.path.join(RUNTIME_DIR, "runtime_a2a3", "core", "common")
+    if os.path.exists(aicore_kernel_src) and ccec_available:
+        print("\n  [4/7] Linking AICore kernel binary...")
+        
+        # Collect all .o files from incore_aic and incore_aiv
+        aic_objs = glob.glob(os.path.join(aic_dir, "*.o")) if os.path.exists(aic_dir) else []
+        aiv_objs = glob.glob(os.path.join(aiv_dir, "*.o")) if os.path.exists(aiv_dir) else []
+        
+        # Build directory for AICore kernel
+        aicore_build_dir = os.path.join(code_dir, "aicore_build")
+        os.makedirs(aicore_build_dir, exist_ok=True)
+        
+        # Compile aicore_kernel.cpp for both AIC and AIV
+        aicore_flags = (
+            f"-c -O3 -x cce -std=c++17 --cce-aicore-only "
+            f"-mllvm -cce-aicore-stack-size=0x8000 "
+            f"-mllvm -cce-aicore-function-stack-size=0x8000 "
+            f"-I{common_dir} -I{code_dir}"
+        )
+        
+        # Compile for AIC
+        aic_kernel_obj = os.path.join(aicore_build_dir, "aicore_kernel_aic.o")
+        cmd = f"{ccec_path} {aicore_flags} -D__AIC__ --cce-aicore-arch=dav-c220-cube -o {aic_kernel_obj} {aicore_kernel_src}"
+        ok, _, stderr = run_command(cmd, timeout=120)
+        if ok:
+            print(f"    ✓ Compiled aicore_kernel for AIC")
+        else:
+            print(f"    ✗ Failed AIC: {stderr}")
+            success = False
+        
+        # Compile for AIV
+        aiv_kernel_obj = os.path.join(aicore_build_dir, "aicore_kernel_aiv.o")
+        cmd = f"{ccec_path} {aicore_flags} -D__AIV__ --cce-aicore-arch=dav-c220-vec -o {aiv_kernel_obj} {aicore_kernel_src}"
+        ok, _, stderr = run_command(cmd, timeout=120)
+        if ok:
+            print(f"    ✓ Compiled aicore_kernel for AIV")
+        else:
+            print(f"    ✗ Failed AIV: {stderr}")
+            success = False
+        
+        # Link all objects into aicore_kernel.o
+        all_objs = [aic_kernel_obj, aiv_kernel_obj] + aic_objs + aiv_objs
+        aicore_kernel_out = os.path.join(code_dir, "aicore_kernel.o")
+        if all_objs:
+            cmd = f"{ld_path} -m aicorelinux -Ttext=0 -static -n -o {aicore_kernel_out} {' '.join(all_objs)}"
+            ok, _, stderr = run_command(cmd, timeout=120)
+            if ok:
+                print(f"    ✓ Linked: {aicore_kernel_out}")
+            else:
+                print(f"    ✗ Link failed: {stderr}")
+                success = False
+    elif not ccec_available:
+        print("\n  [4/7] Skipping AICore kernel (ccec not available)")
+    else:
+        print("\n  [4/7] Skipping AICore kernel (source not found)")
+    
+    # 5. Compile AICPU kernel (requires ARM64 gcc)
+    aicpu_kernel_src = os.path.join(RUNTIME_DIR, "runtime_a2a3", "core", "aicpu", "aicpu_kernel.cpp")
+    if os.path.exists(aicpu_kernel_src):
+        print("\n  [5/7] Compiling AICPU kernel...")
+        
+        # Check for ARM64 cross-compiler or native ARM64
+        import platform
+        is_arm64 = platform.machine() in ('aarch64', 'arm64')
+        arm64_gcc = "aarch64-linux-gnu-g++" if not is_arm64 else "g++"
+        
+        # Check if compiler exists
+        ok, _, _ = run_command(f"which {arm64_gcc}", timeout=10)
+        if ok or is_arm64:
+            aicpu_build_dir = os.path.join(code_dir, "aicpu_build")
+            os.makedirs(aicpu_build_dir, exist_ok=True)
+            
+            aicpu_so = os.path.join(code_dir, "libaicpu_kernel.so")
+            cmd = (
+                f"{arm64_gcc} -O3 -std=c++17 -fPIC -shared -Wall "
+                f"-DENABLE_AICPU_LOG "
+                f"-I{common_dir} -I{code_dir} "
+                f"-o {aicpu_so} {aicpu_kernel_src}"
+            )
+            
+            ok, _, stderr = run_command(cmd, timeout=120)
+            if ok:
+                print(f"    ✓ Compiled: {aicpu_so}")
+            else:
+                print(f"    ✗ Failed: {stderr}")
+                # Not a hard failure - AICPU kernel is needed only on device
+        else:
+            print(f"    Skipping: ARM64 compiler not available ({arm64_gcc})")
+            print(f"    Note: AICPU kernel can be built on device or with cross-compiler")
+    else:
+        print("\n  [5/7] Skipping AICPU kernel (source not found)")
+    
+    # 6. Generate and compile test program
+    print("\n  [6/7] Generating and compiling test program...")
     
     # Get example name from directory structure (e.g., "bgemm" from .../bgemm/output/platform/generated_code)
     platform_dir = os.path.dirname(code_dir)  # .../bgemm/output/platform
@@ -853,19 +951,23 @@ def compile_ascend_a2a3(code_dir):
     include_paths = [
         f"-I{RUNTIME_DIR}",
         f"-I{code_dir}",
+        f"-I{common_dir}",
     ]
     
     # Add CANN SDK include path if available
     if cann_available:
         include_paths.append(f"-I{ascend_home}/include")
     
-    # Find all runtime source files needed
+    # Find all runtime source files needed (host-side only)
+    # Note: a2a3_core_worker.c is included for stub mode (CPU simulation)
+    # On real hardware, workers run on NPU via aicore_kernel and aicpu_kernel
     runtime_sources = [
         os.path.join(RUNTIME_DIR, "pto_runtime.c"),
         os.path.join(RUNTIME_DIR, "runtime_a2a3", "a2a3_runtime.c"),
         os.path.join(RUNTIME_DIR, "runtime_a2a3", "host", "a2a3_host.c"),
         os.path.join(RUNTIME_DIR, "runtime_a2a3", "host", "a2a3_so_loader.c"),
-        os.path.join(RUNTIME_DIR, "runtime_a2a3", "core", "a2a3_core_worker.c"),
+        os.path.join(RUNTIME_DIR, "runtime_a2a3", "host", "a2a3_binary_loader.c"),
+        os.path.join(RUNTIME_DIR, "runtime_a2a3", "core", "a2a3_core_worker.c"),  # Stub mode workers
         os.path.join(RUNTIME_DIR, "runtime_a2a3", "orchestration", "a2a3_orchestration.c"),
     ]
     
@@ -897,6 +999,30 @@ def compile_ascend_a2a3(code_dir):
     else:
         print(f"    ✗ Runtime source files not found")
         success = False
+    
+    # 7. Summary of generated NPU binaries
+    print("\n  [7/7] NPU binary summary...")
+    aicore_kernel_out = os.path.join(code_dir, "aicore_kernel.o")
+    aicpu_so = os.path.join(code_dir, "libaicpu_kernel.so")
+    
+    if os.path.exists(aicore_kernel_out):
+        size = os.path.getsize(aicore_kernel_out)
+        print(f"    AICore kernel: {aicore_kernel_out} ({size} bytes)")
+    else:
+        print(f"    AICore kernel: not built")
+        
+    if os.path.exists(aicpu_so):
+        size = os.path.getsize(aicpu_so)
+        print(f"    AICPU kernel:  {aicpu_so} ({size} bytes)")
+    else:
+        print(f"    AICPU kernel:  not built (requires ARM64 gcc)")
+    
+    # List InCore .o files
+    aic_objs = glob.glob(os.path.join(aic_dir, "*.o")) if os.path.exists(aic_dir) else []
+    aiv_objs = glob.glob(os.path.join(aiv_dir, "*.o")) if os.path.exists(aiv_dir) else []
+    if aic_objs or aiv_objs:
+        print(f"    InCore AIC:    {len(aic_objs)} object files")
+        print(f"    InCore AIV:    {len(aiv_objs)} object files")
     
     return success
 
@@ -964,7 +1090,7 @@ def analyze_task_dump(dump_file):
         
         # Count by type if available
         lines = content.split('\n')
-        task_types = {{}}
+        task_types = dict()
         for line in lines:
             if "func=" in line:
                 # Extract function name
@@ -993,7 +1119,7 @@ def analyze_task_dump(dump_file):
 def generate_task_graph_pdf():
     """Generate task graph visualization as PDF."""
     if not CONFIG['enable_task_graph_pdf']:
-        return True
+        return None  # Skipped
     
     print_header("Task Graph PDF Generation")
     
@@ -1308,7 +1434,7 @@ def run_accuracy_test():
         return True
     
     # Read parameters
-    params = {{}}
+    params = dict()
     if os.path.exists(params_file):
         with open(params_file, 'r') as f:
             for line in f:
@@ -1513,7 +1639,12 @@ def main():
     
     print_header("Summary")
     for name, success in results:
-        status = "✓ OK" if success else "✗ FAILED"
+        if success is None:
+            status = "- SKIPPED"
+        elif success:
+            status = "✓ OK"
+        else:
+            status = "✗ FAILED"
         print(f"  {name}: {status}")
     
     print("\nDone!")

@@ -5,14 +5,14 @@
  * Worker threads and task execution are delegated to the core layer.
  */
 
-// POSIX definitions must come before any includes
+// POSIX definitions must come FIRST, before ANY includes
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 199309L
 #endif
 
+#include <time.h>  // Must be after _POSIX_C_SOURCE for nanosleep
 #include "a2a3_host.h"
 #include "../core/a2a3_core_worker.h"
-#include <time.h>
 
 // =============================================================================
 // Public API Implementation

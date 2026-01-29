@@ -22,11 +22,18 @@
 #ifndef PTO_RUNTIME_COMMON_H
 #define PTO_RUNTIME_COMMON_H
 
+// POSIX definitions must come FIRST, before ANY system includes
+// This enables clock_gettime, nanosleep, pthread_cond_timedwait, etc.
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 199309L
+#endif
+
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
 #include <pthread.h>
 
 // =============================================================================
