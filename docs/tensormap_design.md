@@ -7,6 +7,10 @@ TensorMap 是 PTO Runtime2 中用于追踪 **生产者-消费者关系** 的核�
 1. **依赖发现**：当提交新任务时，查找输入 tensor 的生产者任务
 2. **重叠检测**：支持对 view、reshape、transpose 等操作后的 tensor 进行正确的依赖匹配
 3. **高效管理**：O(1) 插入，惰性失效，链截断优化
+4. **混合检测算法**：自动选择最优检测方法
+   - 连续 tensor：O(1) Bounding Box（精确）
+   - 1D 非连续：精确 GCD 算法
+   - **多维非连续：Combined Lattice GCD 方法（新增）**
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -426,9 +430,10 @@ void pto2_tensormap_insert(PTO2TensorMap* tm, PTO2TensorRegion* region,
 | 惰性失效 | ✓ 通过 last_task_alive 阈值 |
 | 链截断优化 | ✓ 遇到失效条目截断整个尾部 |
 | 仅按 base_ptr 哈希 | ✓ 确保同一 tensor 的所有区域在同一桶 |
-| 重叠检测 | ✓ 1D 区间和边界盒两种模式 |
+| 重叠检测 | ✓ 混合方法：Bounding Box + GCD |
 | view/reshape/transpose 支持 | ✓ 通过 LogicalTensor 和边界盒 |
 | 多生产者查找 | ✓ lookup_all 返回所有重叠生产者 |
+| 多维非连续 tensor | ✓ Combined Lattice GCD 方法 |
 
 ---
 
@@ -578,7 +583,9 @@ void pto2_tensormapex_insert(...) {
 
 ### 12.7 GCD 方法详解
 
-对于非连续 tensor，使用 GCD（最大公约数）算法精确检测重叠：
+对于非连续 tensor，使用 GCD（最大公约数）算法精确检测重叠。
+
+#### 12.7.1 一维 GCD（精确）
 
 **数学原理**：
 ```
@@ -610,6 +617,88 @@ GCD 检测:
   4 % 8 ≠ 0 -> 无整数解 -> 不重叠 ✓
 ```
 
+#### 12.7.2 多维 GCD（Combined Lattice Method）
+
+对于多维非连续 tensor，使用 **Combined GCD** 方法：
+
+**数学原理**：
+```
+Tensor A 访问的字节偏移: offset_A + Σ(i_d * stride_A[d])
+Tensor B 访问的字节偏移: offset_B + Σ(j_d * stride_B[d])
+
+所有 A 访问的偏移构成一个格点集，间距 = gcd(所有 stride_A[d])
+所有 B 访问的偏移构成一个格点集，间距 = gcd(所有 stride_B[d])
+
+Combined GCD = gcd(gcd_A, gcd_B)
+
+如果 (offset_B - offset_A) 不能被 Combined GCD 整除，
+则 A 和 B 不可能访问同一字节 -> 不重叠（精确）
+```
+
+**算法实现**：
+
+```c
+static int64_t compute_stride_gcd(const PTO2LogicalTensor* t) {
+    int64_t g = 0;
+    for (int32_t d = 0; d < t->ndim; d++) {
+        if (t->strides[d] != 0) {
+            g = gcd(g, llabs(t->strides[d]));
+        }
+    }
+    return g;
+}
+
+static bool overlap_multidim_gcd(const PTO2LogicalTensor* a, 
+                                  const PTO2LogicalTensor* b) {
+    int64_t gcd_a = compute_stride_gcd(a);
+    int64_t gcd_b = compute_stride_gcd(b);
+    int64_t combined_gcd = gcd(gcd_a, gcd_b);
+    
+    if (combined_gcd == 0) {
+        // 都是标量
+        return a->storage_offset == b->storage_offset;
+    }
+    
+    int64_t delta = llabs(b->storage_offset - a->storage_offset);
+    if (delta % combined_gcd != 0) {
+        return false;  // 格点不兼容 -> 不重叠
+    }
+    
+    return true;  // 格点兼容 + bounding box 重叠 -> 可能重叠
+}
+```
+
+**示例：2D 交错 tensor**
+
+```
+Tensor A: shape=[2,4], strides=[16,4], offset=0
+  访问: 0,4,8,12,16,20,24,28 (4 的倍数)
+
+Tensor B: shape=[2,4], strides=[16,4], offset=2
+  访问: 2,6,10,14,18,22,26,30 (偏移 2)
+
+Bounding Box:
+  A: [0, 31]
+  B: [2, 33]
+  交集非空 -> 误报"重叠"
+
+Multi-dim GCD:
+  gcd_A = gcd(16, 4) = 4
+  gcd_B = gcd(16, 4) = 4
+  combined_gcd = gcd(4, 4) = 4
+  delta = |2 - 0| = 2
+  2 % 4 ≠ 0 -> 不重叠 ✓
+```
+
+#### 12.7.3 复杂度对比
+
+| 方法 | 精确度 | 时间复杂度 |
+|------|--------|------------|
+| Bounding Box | 保守（有误报） | O(ndim) |
+| 1D GCD | 精确 | O(1) |
+| Multi-dim GCD | 较精确（少量误报） | O(ndim) |
+| Full Lattice | 精确 | O(ndim³) |
+
 ### 12.8 实现状态
 
 | 功能 | 状态 |
@@ -617,5 +706,6 @@ GCD 检测:
 | is_simple 字段 | ✓ 已添加到 TensorMapEntryEx |
 | hybrid 检测函数 | ✓ 已实现 |
 | TensorMap 集成 | ✓ lookup 使用 hybrid |
-| 1D GCD 检测 | ✓ 完整实现 |
-| 多维 GCD 检测 | ✓ 降维到 1D 处理 |
+| 1D GCD 检测 | ✓ 精确实现（带范围验证） |
+| 多维 GCD 检测 | ✓ Combined Lattice Method |
+| 测试覆盖 | ✓ test_hybrid_overlap.c (7 个测试用例) |

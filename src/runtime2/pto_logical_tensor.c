@@ -244,6 +244,77 @@ bool pto2_overlap_1d_exact(
     return k_min <= k_max;
 }
 
+/**
+ * Compute the GCD of all non-zero strides from a tensor
+ * Returns 0 if all strides are zero (scalar-like access pattern)
+ */
+static int64_t compute_stride_gcd(const PTO2LogicalTensor* t) {
+    int64_t g = 0;
+    for (int32_t d = 0; d < t->ndim; d++) {
+        if (t->strides[d] != 0) {
+            int64_t s = t->strides[d];
+            if (s < 0) s = -s;  // Use absolute value
+            g = gcd(g, s);
+        }
+    }
+    return g;
+}
+
+/**
+ * Multi-dimensional GCD-based overlap detection
+ * 
+ * Mathematical basis:
+ *   Tensor A touches offsets: offset_a + Σ(i_d * stride_a[d])
+ *   Tensor B touches offsets: offset_b + Σ(j_d * stride_b[d])
+ * 
+ *   The set of all offsets touched by A forms a lattice with spacing = gcd(all strides of A)
+ *   Similarly for B.
+ *   
+ *   Combined lattice spacing = gcd(gcd_A, gcd_B)
+ *   
+ *   If (offset_b - offset_a) is not divisible by this combined GCD,
+ *   then A and B cannot touch the same byte -> NO OVERLAP (exact)
+ *   
+ *   If divisible, we need further range checks (may still be conservative)
+ */
+static bool overlap_multidim_gcd(
+    const PTO2LogicalTensor* a,
+    const PTO2LogicalTensor* b
+) {
+    // Compute GCD of all strides from both tensors
+    int64_t gcd_a = compute_stride_gcd(a);
+    int64_t gcd_b = compute_stride_gcd(b);
+    int64_t combined_gcd = gcd(gcd_a, gcd_b);
+    
+    // Handle scalar case (all strides zero)
+    if (combined_gcd == 0) {
+        // Both tensors access only their storage_offset
+        return a->storage_offset == b->storage_offset;
+    }
+    
+    // Check if offset difference is on the combined lattice
+    int64_t delta = b->storage_offset - a->storage_offset;
+    if (delta < 0) delta = -delta;
+    
+    if (delta % combined_gcd != 0) {
+        // Offset difference is NOT divisible by combined GCD
+        // This means A and B access interleaved addresses -> NO OVERLAP
+        return false;
+    }
+    
+    // GCD test passed: offsets are compatible
+    // Now check if valid indices exist within bounds
+    // 
+    // This is a conservative check: we verify that the bounding boxes
+    // overlap AND the lattices are compatible. This eliminates many
+    // false positives while remaining O(ndim).
+    //
+    // For a fully exact solution, we would need to solve a system of
+    // linear Diophantine equations with bounds, which is O(ndim³).
+    
+    return true;  // Lattices compatible + bounding boxes overlap -> likely overlap
+}
+
 bool pto2_logical_tensor_overlap_exact(
     const PTO2LogicalTensor* a,
     const PTO2LogicalTensor* b
@@ -259,15 +330,7 @@ bool pto2_logical_tensor_overlap_exact(
         return false;
     }
     
-    // For exact check, we need to verify that there exist indices
-    // (i0, i1, ...) and (j0, j1, ...) such that:
-    // a.offset + sum(i_d * a.stride[d]) = b.offset + sum(j_d * b.stride[d])
-    //
-    // This is a multi-dimensional Diophantine problem.
-    // For simplicity, we use a conservative approach:
-    // Flatten both tensors to 1D and check overlap.
-    
-    // For contiguous tensors, this is straightforward
+    // For contiguous tensors, bounding box is exact
     if (a->is_contiguous && b->is_contiguous) {
         // Both contiguous: simple interval check
         int64_t a_start = a->storage_offset;
@@ -277,7 +340,7 @@ bool pto2_logical_tensor_overlap_exact(
         return (a_start < b_end) && (b_start < a_end);
     }
     
-    // For 1D tensors, use exact GCD check
+    // For 1D tensors, use exact GCD check with range validation
     if (a->ndim == 1 && b->ndim == 1) {
         return pto2_overlap_1d_exact(
             a->storage_offset, a->strides[0], a->shape[0],
@@ -286,14 +349,8 @@ bool pto2_logical_tensor_overlap_exact(
     }
     
     // For multi-dimensional non-contiguous tensors:
-    // We use a more complex approach - check each dimension
-    // This is a simplification that may still have false positives
-    // for very complex stride patterns, but handles common cases.
-    
-    // Conservative approach for now: use bounding box result
-    // A full multi-dimensional GCD solver is beyond scope
-    // Real-world use: 1D exact + fallback to bounding box
-    return true;  // Conservative: bounding box already confirmed overlap
+    // Use combined GCD method to eliminate false positives
+    return overlap_multidim_gcd(a, b);
 }
 
 bool pto2_tensormap_entry_overlap_fast(

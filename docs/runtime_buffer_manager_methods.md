@@ -1885,14 +1885,19 @@ This section describes how tensor extraction operations affect memory layout and
 │                                                                              │
 │   2. Complex Tensor (is_contiguous = false):                                 │
 │      → Use Bounding Box for quick rejection                                  │
-│      → If overlap detected, verify with GCD (eliminates false positives)    │
+│      → 1D: Use exact GCD with range validation                              │
+│      → Multi-D: Use Combined Lattice GCD method                             │
+│        (computes gcd of all strides, checks offset divisibility)            │
 │                                                                              │
 │   This provides:                                                             │
 │   • O(1) fast path for the common case (contiguous tensors)                 │
-│   • 100% accuracy for all cases (no false positives)                        │
+│   • O(ndim) for multi-dimensional non-contiguous tensors                    │
+│   • Eliminates most false positives from bounding box                       │
 │   • Automatic method selection based on tensor complexity                    │
 │                                                                              │
-│   API: pto2_logical_tensor_overlap_hybrid()                                 │
+│   APIs:                                                                      │
+│   • pto2_logical_tensor_overlap_hybrid()  - recommended                     │
+│   • pto2_logical_tensor_overlap_exact()   - multi-dim GCD support           │
 │                                                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -2048,6 +2053,28 @@ bool fast = pto2_logical_tensor_overlap_fast(&A, &B);  // true (wrong!)
 // GCD: delta=4, gcd(8,8)=8, 4 % 8 != 0 -> NO OVERLAP
 bool exact = pto2_logical_tensor_overlap_exact(&A, &B);  // false (correct!)
 ```
+
+**Multi-Dimensional GCD (Combined Lattice Method):**
+
+For multi-dimensional non-contiguous tensors, the algorithm computes the combined GCD of all strides:
+
+```c
+// For tensors A and B:
+// gcd_A = gcd(stride_A[0], stride_A[1], ..., stride_A[ndim-1])
+// gcd_B = gcd(stride_B[0], stride_B[1], ..., stride_B[ndim-1])
+// combined_gcd = gcd(gcd_A, gcd_B)
+//
+// If |offset_B - offset_A| % combined_gcd != 0 -> NO OVERLAP (exact)
+
+// Example: 2D tensors with interleaved access patterns
+// A: shape=[2,4], strides=[16,4], offset=0 -> accesses 0,4,8,12,16,20,24,28
+// B: shape=[2,4], strides=[16,4], offset=2 -> accesses 2,6,10,14,18,22,26,30
+//
+// gcd(16,4) = 4, combined_gcd = 4, delta = 2
+// 2 % 4 != 0 -> NO OVERLAP (correct!)
+```
+
+This eliminates many false positives from pure bounding box checks while maintaining O(ndim) complexity.
 
 **Interval Tree for O(log n + k) Queries:**
 
