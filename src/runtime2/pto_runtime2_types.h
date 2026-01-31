@@ -119,6 +119,43 @@ typedef struct {
 #define PTO2_MAX_TENSOR_DIM   8
 
 /**
+ * Maximum depth of layout history for HBB overlap detection
+ * Simple (contiguous) tensor has depth=1, non-contiguous has depth>1
+ */
+#define PTO2_MAX_LAYOUT_DEPTH     8
+
+/**
+ * Layout operation type for HBB
+ */
+typedef enum {
+    PTO2_LAYOUT_VIEW = 0,         // View/slice: records bounding box
+    PTO2_LAYOUT_RESHAPE = 1,      // Reshape: records new shape
+    PTO2_LAYOUT_TRANSPOSE = 2     // Transpose: records permutation
+} PTO2LayoutOpType;
+
+/**
+ * Layout operation entry for HBB
+ * Each entry records one derivation step from the parent tensor.
+ */
+typedef struct {
+    PTO2LayoutOpType type;
+    union {
+        struct {  // PTO2_LAYOUT_VIEW
+            int64_t bbox_min;     // First byte accessed
+            int64_t bbox_max;     // Last byte accessed
+        } view;
+        struct {  // PTO2_LAYOUT_RESHAPE
+            int32_t ndim;
+            int64_t shape[PTO2_MAX_TENSOR_DIM];
+        } reshape;
+        struct {  // PTO2_LAYOUT_TRANSPOSE
+            int32_t ndim;
+            int32_t perm[PTO2_MAX_TENSOR_DIM];
+        } transpose;
+    };
+} PTO2LayoutOp;
+
+/**
  * Tensor extraction type (for tracking how tensor was created)
  */
 typedef enum {
@@ -187,6 +224,11 @@ typedef struct {
     // === Extraction tracking ===
     PTO2TensorExtractionType extraction_type;  // How this tensor was created
     bool     is_contiguous;       // True if memory is contiguous (no gaps)
+                                  // Equivalent to layout_depth == 1
+    
+    // === Layout history for HBB overlap detection ===
+    int32_t  layout_depth;                           // Number of layout ops (1=simple)
+    PTO2LayoutOp layout_ops[PTO2_MAX_LAYOUT_DEPTH];  // Derivation history
     
 } PTO2LogicalTensor;
 
@@ -310,11 +352,11 @@ typedef struct {
  * Extended TensorMap entry structure (for LogicalTensor support)
  * 
  * Supports multi-dimensional tensors with view/reshape/transpose operations.
- * Uses bounding box for fast overlap detection.
+ * Uses Hierarchical Bounding Box (HBB) for overlap detection.
  * 
  * Hash strategy: 
  *   - Primary key: raw_base (groups all views of same storage)
- *   - Within bucket: check bounding box overlap
+ *   - Within bucket: use HBB overlap detection
  */
 typedef struct {
     // === Raw tensor identification (for grouping into same bucket) ===
@@ -322,15 +364,19 @@ typedef struct {
     int64_t  raw_total_size;      // Total size of raw tensor (for validation)
     
     // === Bounding box (precomputed for fast overlap check) ===
-    // Overlap if: (A.min <= B.max) && (B.min <= A.max)
+    // Quick rejection: no overlap if bbox don't intersect
     int64_t  min_byte_offset;     // First byte accessed (relative to raw_base)
     int64_t  max_byte_offset;     // Last byte accessed (relative to raw_base)
     
-    // === Full logical tensor info (for GCD-based exact check, optional) ===
+    // === Full logical tensor info (for legacy compatibility) ===
     int64_t  storage_offset;      // Byte offset from raw_base
     int64_t  shape[PTO2_MAX_TENSOR_DIM];    // Shape in each dimension
     int64_t  strides[PTO2_MAX_TENSOR_DIM];  // Strides in each dimension
     int32_t  ndim;                // Number of dimensions
+    
+    // === HBB Layout History (for precise overlap detection) ===
+    int32_t  layout_depth;                           // Number of layout ops (1=simple)
+    PTO2LayoutOp layout_ops[PTO2_MAX_LAYOUT_DEPTH];  // Derivation history
     
     // === Producer tracking ===
     int32_t  producer_task_id;    // Task that produces this tensor
@@ -342,7 +388,7 @@ typedef struct {
     
     // === Flags ===
     bool     is_deep_copy;        // True if this is a deep copy (independent storage)
-    bool     is_simple;           // True if contiguous (bounding box is exact, no GCD needed)
+    bool     is_simple;           // Deprecated: equivalent to (layout_depth == 1)
     
 } PTO2TensorMapEntryEx;
 

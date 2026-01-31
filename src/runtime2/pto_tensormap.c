@@ -653,7 +653,18 @@ void pto2_tensormapex_insert(PTO2TensorMapEx* tm,
     
     entry->producer_task_id = producer_task_id;
     entry->is_deep_copy = (tensor->extraction_type >= PTO2_TENSOR_DEEP_VIEW);
-    entry->is_simple = tensor->is_contiguous;  // Record complexity for hybrid detection
+    entry->is_simple = tensor->is_contiguous;  // Deprecated: use layout_depth == 1
+    
+    // Copy HBB layout history
+    entry->layout_depth = tensor->layout_depth;
+    for (int32_t i = 0; i < tensor->layout_depth && i < PTO2_MAX_LAYOUT_DEPTH; i++) {
+        entry->layout_ops[i] = tensor->layout_ops[i];
+    }
+    for (int32_t i = tensor->layout_depth; i < PTO2_MAX_LAYOUT_DEPTH; i++) {
+        entry->layout_ops[i].type = PTO2_LAYOUT_VIEW;
+        entry->layout_ops[i].view.bbox_min = 0;
+        entry->layout_ops[i].view.bbox_max = 0;
+    }
     
     // Insert at head of hash bucket
     uint32_t bucket = pto2_tensormapex_hash(tm, tensor);

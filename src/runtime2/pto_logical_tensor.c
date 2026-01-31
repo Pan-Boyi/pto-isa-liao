@@ -380,8 +380,283 @@ bool pto2_tensor_entry_overlap_hybrid(
         return true;
     }
     
-    // 4. At least one non-contiguous => conservative bounding box
-    //    Note: GCD methods disabled (don't work when stride=1)
+    // 4. At least one non-contiguous => use HBB if available
+    //    Fall back to conservative bounding box if layout_depth not set
+    if (tensor->layout_depth > 0 && entry->layout_depth > 0) {
+        // Use HBB overlap detection
+        return pto2_tensor_entry_overlap_hbb(tensor, entry);
+    }
+    
+    // Conservative: bounding box overlap -> assume real overlap
+    return true;
+}
+
+// =============================================================================
+// Hierarchical Bounding Box (HBB) Overlap Detection
+// =============================================================================
+
+/**
+ * Compare two shapes for equality
+ */
+static bool shapes_equal(const PTO2LayoutOp* a, const PTO2LayoutOp* b) {
+    if (a->reshape.ndim != b->reshape.ndim) {
+        return false;
+    }
+    for (int32_t d = 0; d < a->reshape.ndim; d++) {
+        if (a->reshape.shape[d] != b->reshape.shape[d]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * Compare two permutations for equality
+ */
+static bool perms_equal(const PTO2LayoutOp* a, const PTO2LayoutOp* b) {
+    if (a->transpose.ndim != b->transpose.ndim) {
+        return false;
+    }
+    for (int32_t d = 0; d < a->transpose.ndim; d++) {
+        if (a->transpose.perm[d] != b->transpose.perm[d]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool pto2_layout_history_overlap(
+    const PTO2LogicalTensor* a,
+    const PTO2LogicalTensor* b
+) {
+    // 1. Different raw storage => no overlap
+    if (a->raw_base != b->raw_base) {
+        return false;
+    }
+    
+    // 2. If either has no layout history, fall back to bounding box
+    if (a->layout_depth <= 0 || b->layout_depth <= 0) {
+        // Use simple bounding box check
+        if (a->max_byte_offset < b->min_byte_offset ||
+            b->max_byte_offset < a->min_byte_offset) {
+            return false;
+        }
+        return true;  // Conservative
+    }
+    
+    // 3. Compare layout history level by level
+    int32_t min_depth = (a->layout_depth < b->layout_depth) ? 
+                         a->layout_depth : b->layout_depth;
+    
+    for (int32_t i = 0; i < min_depth; i++) {
+        const PTO2LayoutOp* op_a = &a->layout_ops[i];
+        const PTO2LayoutOp* op_b = &b->layout_ops[i];
+        
+        // Types must match
+        if (op_a->type != op_b->type) {
+            // Different operation types => conservative overlap
+            return true;
+        }
+        
+        switch (op_a->type) {
+            case PTO2_LAYOUT_VIEW:
+                // Check if bounding boxes are disjoint
+                if (op_a->view.bbox_max < op_b->view.bbox_min ||
+                    op_b->view.bbox_max < op_a->view.bbox_min) {
+                    // Disjoint at this level => definitely no overlap!
+                    return false;
+                }
+                // Overlapping bboxes, continue to next level
+                break;
+                
+            case PTO2_LAYOUT_RESHAPE:
+                // Different shapes => conservative overlap
+                if (!shapes_equal(op_a, op_b)) {
+                    return true;
+                }
+                // Same reshape, continue
+                break;
+                
+            case PTO2_LAYOUT_TRANSPOSE:
+                // Different permutations => conservative overlap
+                if (!perms_equal(op_a, op_b)) {
+                    return true;
+                }
+                // Same transpose, continue
+                break;
+        }
+    }
+    
+    // All common levels passed without finding disjoint bbox
+    // Check remaining levels if depths differ
+    if (a->layout_depth != b->layout_depth) {
+        // Different depths: the deeper tensor has more operations
+        // This is a complex case, return conservative overlap
+        return true;
+    }
+    
+    // Same depth, all levels checked, bboxes overlap at all levels
+    return true;
+}
+
+bool pto2_tensor_entry_overlap_hbb(
+    const PTO2LogicalTensor* tensor,
+    const PTO2TensorMapEntryEx* entry
+) {
+    // 1. Different raw storage => no overlap
+    if (tensor->raw_base != entry->raw_base) {
+        return false;
+    }
+    
+    // 2. Quick bounding box rejection
+    if (tensor->max_byte_offset < entry->min_byte_offset ||
+        entry->max_byte_offset < tensor->min_byte_offset) {
+        return false;
+    }
+    
+    // 3. If either has no layout history, conservative overlap
+    if (tensor->layout_depth <= 0 || entry->layout_depth <= 0) {
+        return true;
+    }
+    
+    // 4. Compare layout history level by level
+    int32_t min_depth = (tensor->layout_depth < entry->layout_depth) ?
+                         tensor->layout_depth : entry->layout_depth;
+    
+    for (int32_t i = 0; i < min_depth; i++) {
+        const PTO2LayoutOp* op_a = &tensor->layout_ops[i];
+        const PTO2LayoutOp* op_b = &entry->layout_ops[i];
+        
+        if (op_a->type != op_b->type) {
+            return true;  // Different types => conservative
+        }
+        
+        switch (op_a->type) {
+            case PTO2_LAYOUT_VIEW:
+                if (op_a->view.bbox_max < op_b->view.bbox_min ||
+                    op_b->view.bbox_max < op_a->view.bbox_min) {
+                    return false;  // Disjoint => no overlap
+                }
+                break;
+                
+            case PTO2_LAYOUT_RESHAPE:
+                if (!shapes_equal(op_a, op_b)) {
+                    return true;
+                }
+                break;
+                
+            case PTO2_LAYOUT_TRANSPOSE:
+                if (!perms_equal(op_a, op_b)) {
+                    return true;
+                }
+                break;
+        }
+    }
+    
+    return true;  // Conservative
+}
+
+void pto2_layout_history_init_raw(PTO2LogicalTensor* tensor) {
+    // Simple/raw tensor: depth=1, single VIEW covering entire storage
+    tensor->layout_depth = 1;
+    tensor->layout_ops[0].type = PTO2_LAYOUT_VIEW;
+    tensor->layout_ops[0].view.bbox_min = tensor->min_byte_offset;
+    tensor->layout_ops[0].view.bbox_max = tensor->max_byte_offset;
+    
+    // Clear remaining ops
+    for (int32_t i = 1; i < PTO2_MAX_LAYOUT_DEPTH; i++) {
+        tensor->layout_ops[i].type = PTO2_LAYOUT_VIEW;
+        tensor->layout_ops[i].view.bbox_min = 0;
+        tensor->layout_ops[i].view.bbox_max = 0;
+    }
+}
+
+bool pto2_layout_history_append_view(
+    PTO2LogicalTensor* dst,
+    const PTO2LogicalTensor* src,
+    int64_t bbox_min,
+    int64_t bbox_max
+) {
+    // Copy source layout history
+    dst->layout_depth = src->layout_depth;
+    for (int32_t i = 0; i < src->layout_depth && i < PTO2_MAX_LAYOUT_DEPTH; i++) {
+        dst->layout_ops[i] = src->layout_ops[i];
+    }
+    
+    // Check if we can append
+    if (dst->layout_depth >= PTO2_MAX_LAYOUT_DEPTH) {
+        // Max depth reached, cannot append more
+        // The last level will be overwritten (loses precision but still safe)
+        dst->layout_ops[PTO2_MAX_LAYOUT_DEPTH - 1].type = PTO2_LAYOUT_VIEW;
+        dst->layout_ops[PTO2_MAX_LAYOUT_DEPTH - 1].view.bbox_min = bbox_min;
+        dst->layout_ops[PTO2_MAX_LAYOUT_DEPTH - 1].view.bbox_max = bbox_max;
+        return false;  // Indicate overflow
+    }
+    
+    // Append VIEW operation
+    dst->layout_ops[dst->layout_depth].type = PTO2_LAYOUT_VIEW;
+    dst->layout_ops[dst->layout_depth].view.bbox_min = bbox_min;
+    dst->layout_ops[dst->layout_depth].view.bbox_max = bbox_max;
+    dst->layout_depth++;
+    
+    return true;
+}
+
+bool pto2_layout_history_append_reshape(
+    PTO2LogicalTensor* dst,
+    const PTO2LogicalTensor* src,
+    const int64_t* shape,
+    int32_t ndim
+) {
+    // Copy source layout history
+    dst->layout_depth = src->layout_depth;
+    for (int32_t i = 0; i < src->layout_depth && i < PTO2_MAX_LAYOUT_DEPTH; i++) {
+        dst->layout_ops[i] = src->layout_ops[i];
+    }
+    
+    // Check if we can append
+    if (dst->layout_depth >= PTO2_MAX_LAYOUT_DEPTH) {
+        return false;
+    }
+    
+    // Append RESHAPE operation
+    PTO2LayoutOp* op = &dst->layout_ops[dst->layout_depth];
+    op->type = PTO2_LAYOUT_RESHAPE;
+    op->reshape.ndim = (ndim > PTO2_MAX_TENSOR_DIM) ? PTO2_MAX_TENSOR_DIM : ndim;
+    for (int32_t d = 0; d < op->reshape.ndim; d++) {
+        op->reshape.shape[d] = shape[d];
+    }
+    dst->layout_depth++;
+    
+    return true;
+}
+
+bool pto2_layout_history_append_transpose(
+    PTO2LogicalTensor* dst,
+    const PTO2LogicalTensor* src,
+    const int32_t* perm,
+    int32_t ndim
+) {
+    // Copy source layout history
+    dst->layout_depth = src->layout_depth;
+    for (int32_t i = 0; i < src->layout_depth && i < PTO2_MAX_LAYOUT_DEPTH; i++) {
+        dst->layout_ops[i] = src->layout_ops[i];
+    }
+    
+    // Check if we can append
+    if (dst->layout_depth >= PTO2_MAX_LAYOUT_DEPTH) {
+        return false;
+    }
+    
+    // Append TRANSPOSE operation
+    PTO2LayoutOp* op = &dst->layout_ops[dst->layout_depth];
+    op->type = PTO2_LAYOUT_TRANSPOSE;
+    op->transpose.ndim = (ndim > PTO2_MAX_TENSOR_DIM) ? PTO2_MAX_TENSOR_DIM : ndim;
+    for (int32_t d = 0; d < op->transpose.ndim; d++) {
+        op->transpose.perm[d] = perm[d];
+    }
+    dst->layout_depth++;
+    
     return true;
 }
 
@@ -514,6 +789,9 @@ void pto2_logical_tensor_init_raw(
     
     // Compute bounding box
     pto2_logical_tensor_update_bounding_box(tensor);
+    
+    // Initialize HBB layout history (depth=1, single VIEW)
+    pto2_layout_history_init_raw(tensor);
 }
 
 void pto2_logical_tensor_init(
@@ -558,6 +836,9 @@ void pto2_logical_tensor_init(
     
     // Compute bounding box
     pto2_logical_tensor_update_bounding_box(tensor);
+    
+    // Initialize HBB layout history (depth=1, single VIEW)
+    pto2_layout_history_init_raw(tensor);
 }
 
 // =============================================================================

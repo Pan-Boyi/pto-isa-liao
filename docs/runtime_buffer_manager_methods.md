@@ -1878,7 +1878,7 @@ This section describes how tensor extraction operations affect memory layout and
 │                                                                              │
 │   DESIGN DECISION:                                                           │
 │   ═════════════════                                                          │
-│   BOUNDING BOX APPROACH (Implemented in runtime2):                           │
+│   CURRENT: BOUNDING BOX APPROACH (Implemented in runtime2):                  │
 │                                                                              │
 │   1. Simple Tensor (is_contiguous = true):                                   │
 │      → Bounding Box is EXACT (no false positives)                           │
@@ -1889,14 +1889,32 @@ This section describes how tensor extraction operations affect memory layout and
 │   NOTE: GCD-based methods are DISABLED because:                              │
 │   • They don't work when lowest dimension has stride=1 (GCD becomes 1)      │
 │   • They can produce false negatives in certain cases                       │
-│   • Bounding box is safe (no false negatives, correctness guaranteed)       │
 │                                                                              │
-│   This provides:                                                             │
-│   • O(ndim) complexity for all cases                                        │
-│   • NO FALSE NEGATIVES (never misses a real overlap)                        │
-│   • May have false positives for non-contiguous tensors (safe)              │
+│   ─────────────────────────────────────────────────────────────────────────  │
+│   FUTURE: HIERARCHICAL BOUNDING BOX (HBB) METHOD                             │
+│   ─────────────────────────────────────────────────────────────────────────  │
 │                                                                              │
-│   API: pto2_logical_tensor_overlap_hybrid()                                 │
+│   Track tensor derivation history (max 8 levels of view/reshape/transpose)  │
+│   Compare two tensors by walking their derivation paths:                     │
+│                                                                              │
+│   1. Same level, same op type:                                               │
+│      - VIEW: check bbox intersection, if disjoint → NO OVERLAP (exact)      │
+│      - RESHAPE/TRANSPOSE: check if identical, continue if same              │
+│                                                                              │
+│   2. Different op type or different reshape/transpose:                       │
+│      → CONSERVATIVE (assume overlap, safe)                                   │
+│                                                                              │
+│   Example: A[10:50].reshape(8,5) vs A[60:80]                                │
+│     Level 0: VIEW [0,399] == VIEW [0,399] → skip                            │
+│     Level 1: VIEW [40,199] vs VIEW [240,319] → disjoint! → NO OVERLAP       │
+│                                                                              │
+│   Benefits:                                                                  │
+│   • O(depth) complexity, depth ≤ 8                                          │
+│   • NO FALSE NEGATIVES (safe)                                               │
+│   • Eliminates many false positives for common patterns                     │
+│   • Works for any dimension/stride combination                              │
+│                                                                              │
+│   Status: Design complete, implementation pending                            │
 │                                                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```

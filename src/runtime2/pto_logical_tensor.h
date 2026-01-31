@@ -217,6 +217,121 @@ void pto2_entry_to_logical_tensor(
 );
 
 // =============================================================================
+// Hierarchical Bounding Box (HBB) Overlap Detection
+// =============================================================================
+
+/**
+ * Check if two layout histories have overlapping memory using HBB algorithm
+ * 
+ * This is the NEW overlap detection method that replaces GCD-based detection.
+ * It works by comparing the derivation history of two tensors level by level.
+ * 
+ * Algorithm:
+ * 1. Different raw_base -> no overlap
+ * 2. For each level i from 0 to min(depth_a, depth_b):
+ *    a. If types differ -> conservative overlap
+ *    b. If both VIEW: check bbox intersection
+ *       - If disjoint -> definitely no overlap (early exit)
+ *       - If overlap -> continue to next level
+ *    c. If both RESHAPE: check if shapes equal
+ *       - If different -> conservative overlap
+ *       - If same -> continue
+ *    d. If both TRANSPOSE: check if perms equal
+ *       - If different -> conservative overlap
+ *       - If same -> continue
+ * 3. All levels pass -> conservative overlap (may overlap)
+ * 
+ * Key insight: Simple tensor = depth=1, so this unifies simple/complex handling.
+ * 
+ * @param a First tensor's layout history
+ * @param b Second tensor's layout history
+ * @return true if may overlap, false if definitely no overlap
+ */
+bool pto2_layout_history_overlap(
+    const PTO2LogicalTensor* a,
+    const PTO2LogicalTensor* b
+);
+
+/**
+ * Check if tensor overlaps with tensormap entry using HBB
+ * 
+ * @param tensor Logical tensor (input being looked up)
+ * @param entry  TensorMap entry (output from previous task)
+ * @return true if may overlap, false if definitely no overlap
+ */
+bool pto2_tensor_entry_overlap_hbb(
+    const PTO2LogicalTensor* tensor,
+    const PTO2TensorMapEntryEx* entry
+);
+
+/**
+ * Initialize layout history for a raw (contiguous) tensor
+ * 
+ * Sets depth=1 with a single VIEW op covering the entire tensor.
+ * This is the base case for all tensor derivations.
+ * 
+ * @param tensor  Tensor to initialize layout history for
+ */
+void pto2_layout_history_init_raw(PTO2LogicalTensor* tensor);
+
+/**
+ * Append a VIEW operation to layout history
+ * 
+ * Called when creating a view/slice of a tensor.
+ * Records the bounding box of the view relative to parent.
+ * 
+ * @param dst     Destination tensor (view being created)
+ * @param src     Source tensor
+ * @param bbox_min Minimum byte offset of view
+ * @param bbox_max Maximum byte offset of view
+ * @return true on success, false if max depth exceeded
+ */
+bool pto2_layout_history_append_view(
+    PTO2LogicalTensor* dst,
+    const PTO2LogicalTensor* src,
+    int64_t bbox_min,
+    int64_t bbox_max
+);
+
+/**
+ * Append a RESHAPE operation to layout history
+ * 
+ * Called when reshaping a tensor.
+ * Records the new shape for comparison.
+ * 
+ * @param dst     Destination tensor (reshaped)
+ * @param src     Source tensor
+ * @param shape   New shape array
+ * @param ndim    Number of dimensions
+ * @return true on success, false if max depth exceeded
+ */
+bool pto2_layout_history_append_reshape(
+    PTO2LogicalTensor* dst,
+    const PTO2LogicalTensor* src,
+    const int64_t* shape,
+    int32_t ndim
+);
+
+/**
+ * Append a TRANSPOSE operation to layout history
+ * 
+ * Called when transposing a tensor.
+ * Records the permutation for comparison.
+ * 
+ * @param dst     Destination tensor (transposed)
+ * @param src     Source tensor
+ * @param perm    Permutation array
+ * @param ndim    Number of dimensions
+ * @return true on success, false if max depth exceeded
+ */
+bool pto2_layout_history_append_transpose(
+    PTO2LogicalTensor* dst,
+    const PTO2LogicalTensor* src,
+    const int32_t* perm,
+    int32_t ndim
+);
+
+// =============================================================================
 // Logical Tensor Creation
 // =============================================================================
 

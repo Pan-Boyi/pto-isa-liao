@@ -583,9 +583,9 @@ void pto2_tensormapex_insert(...) {
 
 ### 12.7 重叠检测方法
 
-当前使用 **Bounding Box** 方法进行重叠检测：
+#### 12.7.1 当前实现：Bounding Box
 
-#### 检测策略
+当前使用简单的 **Bounding Box** 方法：
 
 | Tensor A | Tensor B | 检测方法 | 结果 |
 |----------|----------|----------|------|
@@ -593,47 +593,300 @@ void pto2_tensormapex_insert(...) {
 | 连续 | 非连续 | Bounding Box | 保守（可能有误报） |
 | 非连续 | 非连续 | Bounding Box | 保守（可能有误报） |
 
-#### 为什么不使用 GCD 方法
-
-GCD 方法在理论上可以消除误报，但存在以下限制：
-
-1. **stride=1 问题**：当最低维度的 stride 等于 elem_size（通常为 1-8 字节）时，
-   所有 stride 的 GCD 会变得很小，导致检测失效
-
-2. **False Negative 风险**：当一个 tensor 连续、另一个非连续时，GCD 方法可能
-   错误地报告"不重叠"（实际上有重叠）
-
-3. **复杂度与收益**：精确的多维 GCD 需要 O(ndim³) 复杂度，而 bounding box 只需 O(ndim)
-
-#### 当前实现
-
 ```c
 bool pto2_logical_tensor_overlap_hybrid(a, b) {
-    // 1. 不同存储 -> 不重叠
     if (a->raw_base != b->raw_base) return false;
-    
-    // 2. Bounding box 不相交 -> 不重叠
     if (a->max < b->min || b->max < a->min) return false;
-    
-    // 3. 两者都连续 -> bounding box 精确
     if (a->is_contiguous && b->is_contiguous) return true;
-    
-    // 4. 至少一个非连续 -> 保守返回 true
-    return true;  // 可能有误报，但无漏报
+    return true;  // 保守：可能有误报，但无漏报
 }
 ```
 
-**特性**：
-- ✓ 无漏报（False Negative）：不会错过真正的重叠
-- ⚠️ 可能误报（False Positive）：非连续 tensor 可能报告重叠但实际不重叠
-- 误报是**安全的**：只会创建额外的依赖，不会破坏正确性
+#### 12.7.2 为什么不使用 GCD 方法
+
+GCD 方法存在以下限制：
+
+1. **stride=1 问题**：最低维度 stride 通常等于 elem_size，导致 GCD=1，检测失效
+2. **False Negative 风险**：连续 vs 非连续 tensor 可能产生假阴性
+3. **复杂度高**：精确多维 GCD 需要 O(ndim³)
+
+#### 12.7.3 改进方案：Hierarchical Bounding Box (HBB)
+
+**核心思想**：追踪 tensor 的 **派生历史 (Derivation History)**，通过比较派生路径在早期确定不重叠。
+
+**原理**：
+- 每次 view/reshape/transpose 操作记录到 layout history
+- 比较两个 tensor 时，从根节点开始逐级比较
+- 相同级别可跳过，在第一个不同的 VIEW 级别检查 bbox 是否相交
+- 如果 bbox 不相交，确定不重叠；如果 reshape/transpose 不同，保守返回重叠
+
+**示例 1：来自同一 tensor 的不同 slice**
+
+```
+原始 A: shape=[100], 连续
+
+E = A[10:50].reshape(8,5).transpose()[1:3, 2:6]
+F = A[60:80]
+
+E.layout_history:
+  Level 0: VIEW bbox=[0, 399]      # 原始 A
+  Level 1: VIEW bbox=[40, 199]     # A[10:50]
+  Level 2: RESHAPE [8,5]
+  Level 3: TRANSPOSE [1,0]
+  Level 4: VIEW bbox=[44, 123]
+
+F.layout_history:
+  Level 0: VIEW bbox=[0, 399]      # 相同
+  Level 1: VIEW bbox=[240, 319]    # A[60:80]
+
+比较过程:
+  Level 0: VIEW [0,399] == VIEW [0,399] -> 跳过
+  Level 1: VIEW [40,199] vs VIEW [240,319]
+           bbox 不相交 (199 < 240) -> 返回 不重叠 ✓
+```
+
+**示例 2：相同 reshape 后的不同 slice**
+
+```
+G = A.reshape(10, 10)
+H = G[0:5, :]     # 前 5 行，访问 [0, 199]
+I = G[5:10, :]    # 后 5 行，访问 [200, 399]
+
+H.layout_history:
+  Level 0: VIEW bbox=[0, 399]
+  Level 1: RESHAPE [10,10]
+  Level 2: VIEW bbox=[0, 199]
+
+I.layout_history:
+  Level 0: VIEW bbox=[0, 399]
+  Level 1: RESHAPE [10,10]
+  Level 2: VIEW bbox=[200, 399]
+
+比较过程:
+  Level 0: 相同 VIEW -> 跳过
+  Level 1: 相同 RESHAPE -> 跳过
+  Level 2: VIEW [0,199] vs VIEW [200,399]
+           bbox 不相交 (199 < 200) -> 返回 不重叠 ✓
+```
+
+**示例 3：不同 reshape（保守处理）**
+
+```
+J = A.reshape(10, 10)[0:5, :]
+K = A.reshape(20, 5)[0:10, :]
+
+比较过程:
+  Level 0: 相同 VIEW -> 跳过
+  Level 1: RESHAPE [10,10] vs RESHAPE [20,5]
+           不同的 reshape -> 返回 可能重叠 (保守，安全)
+```
+
+**数据结构**：
+
+```c
+#define PTO2_MAX_LAYOUT_DEPTH 8
+
+typedef enum {
+    PTO2_LAYOUT_VIEW,       // View/slice: 记录 bounding box
+    PTO2_LAYOUT_RESHAPE,    // Reshape: 记录 shape
+    PTO2_LAYOUT_TRANSPOSE,  // Transpose: 记录 permutation
+} PTO2LayoutOpType;
+
+typedef struct {
+    PTO2LayoutOpType type;
+    union {
+        struct {  // VIEW
+            int64_t bbox_min;
+            int64_t bbox_max;
+        } view;
+        struct {  // RESHAPE
+            int32_t ndim;
+            int64_t shape[PTO2_MAX_TENSOR_DIM];
+        } reshape;
+        struct {  // TRANSPOSE
+            int32_t ndim;
+            int32_t perm[PTO2_MAX_TENSOR_DIM];
+        } transpose;
+    };
+} PTO2LayoutOp;
+
+typedef struct {
+    void* raw_base;                           // 原始存储指针
+    int32_t depth;                            // 当前深度 (1 到 MAX)
+    PTO2LayoutOp ops[PTO2_MAX_LAYOUT_DEPTH];  // 操作历史
+} PTO2LayoutHistory;
+```
+
+**统一处理 Simple 和 Non-Simple Tensor**：
+
+HBB 方法统一了连续和非连续 tensor 的处理，不再需要单独的 `is_contiguous` 标志：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Simple Tensor = HBB depth=1 的特例                         │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  Simple (连续) tensor:                                      │
+│    depth = 1                                                │
+│    ops[0] = VIEW { bbox_min=0, bbox_max=total_size-1 }     │
+│                                                             │
+│  Non-simple (非连续) tensor:                                │
+│    depth > 1                                                │
+│    ops[0..n-1] = VIEW/RESHAPE/TRANSPOSE 序列               │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+
+示例：
+
+  // 原始连续 tensor A[1024]
+  A.layout_history = {
+      .depth = 1,
+      .ops[0] = { VIEW, bbox=[0, 4095] }  // 1024 * 4 bytes
+  }
+
+  // A 的 slice: B = A[100:200]
+  B.layout_history = {
+      .depth = 2,
+      .ops[0] = { VIEW, bbox=[0, 4095] },   // 继承自 A
+      .ops[1] = { VIEW, bbox=[400, 799] }   // 100*4 到 200*4-1
+  }
+
+  // B 的 reshape: C = B.reshape(10, 10)
+  C.layout_history = {
+      .depth = 3,
+      .ops[0] = { VIEW, bbox=[0, 4095] },
+      .ops[1] = { VIEW, bbox=[400, 799] },
+      .ops[2] = { RESHAPE, shape=[10, 10] }
+  }
+```
+
+**统一设计的优势**：
+
+| 特性 | 之前（分离设计） | 统一 HBB |
+|------|------------------|----------|
+| 数据结构 | `is_contiguous` + `bbox` 分离 | 只需 `LayoutHistory` |
+| 检测逻辑 | 分支判断连续/非连续 | **单一算法路径** |
+| 代码复杂度 | if-else 分支 | **统一循环** |
+| 可扩展性 | 需要修改多处 | **只需扩展 ops 类型** |
+
+**比较算法**（统一处理 simple 和 non-simple）：
+
+```c
+bool pto2_layout_history_overlap(
+    const PTO2LayoutHistory* a,
+    const PTO2LayoutHistory* b
+) {
+    // 1. 不同原始存储 -> 不重叠
+    if (a->raw_base != b->raw_base) {
+        return false;
+    }
+    
+    // 统一算法：无论 depth=1 (simple) 还是 depth>1 (non-simple)
+    // 都用相同的逻辑处理
+    int min_depth = MIN(a->depth, b->depth);
+    
+    for (int i = 0; i < min_depth; i++) {
+        const PTO2LayoutOp* op_a = &a->ops[i];
+        const PTO2LayoutOp* op_b = &b->ops[i];
+        
+        // 2. 类型不同 -> 保守返回重叠
+        if (op_a->type != op_b->type) {
+            return true;
+        }
+        
+        // 3. 类型相同，按类型处理
+        switch (op_a->type) {
+            case PTO2_LAYOUT_VIEW:
+                // Bounding box 不相交 -> 精确不重叠
+                // 对于 simple tensor (depth=1)，这就是完整的检测
+                if (op_a->view.bbox_max < op_b->view.bbox_min ||
+                    op_b->view.bbox_max < op_a->view.bbox_min) {
+                    return false;  // 确定不重叠！
+                }
+                // bbox 相交，继续下一级（如果有）
+                break;
+                
+            case PTO2_LAYOUT_RESHAPE:
+                // Shape 不同 -> 保守返回重叠
+                if (!shapes_equal(op_a, op_b)) {
+                    return true;
+                }
+                break;
+                
+            case PTO2_LAYOUT_TRANSPOSE:
+                // Perm 不同 -> 保守返回重叠
+                if (!perms_equal(op_a, op_b)) {
+                    return true;
+                }
+                break;
+        }
+    }
+    
+    // 4. 所有共同级别都通过，保守返回可能重叠
+    return true;
+}
+```
+
+**Simple Tensor 的处理流程**：
+
+```
+A: depth=1, ops[0]=VIEW[0, 1023]
+B: depth=1, ops[0]=VIEW[1024, 2047]
+
+比较:
+  i=0: VIEW[0,1023] vs VIEW[1024,2047]
+       1023 < 1024 -> bbox 不相交 -> 返回 false (不重叠)
+
+// 与之前的 "两者都连续 -> bounding box 精确" 逻辑等价
+// 但代码路径统一，无需 if (is_contiguous) 分支
+```
+
+**复杂度分析**：
+
+| 操作 | 复杂度 | 说明 |
+|------|--------|------|
+| 记录操作 | O(1) | 追加到 history |
+| 比较两个 tensor | O(depth) | depth ≤ 8 |
+| 存储开销 | ~128 bytes/tensor | 固定大小 |
+
+**HBB 方法的优势**：
+
+| 特性 | Bounding Box | GCD | HBB |
+|------|--------------|-----|-----|
+| 连续 tensor | 精确 | 精确 | 精确 |
+| 非连续 tensor | 保守 | 失效(stride=1) | **可消除部分误报** |
+| 假阴性风险 | 无 | 有 | **无** |
+| 复杂度 | O(ndim) | O(ndim) | O(depth) |
+| 适用场景 | 通用 | 受限 | **通用** |
+
+**关键洞察**：在实际计算图中，tensor 通常**来自相同祖先**且**派生操作相似**。
+HBB 方法利用这一特点，在保证安全的前提下消除大量误报。
 
 ### 12.8 实现状态
 
-| 功能 | 状态 |
-|------|------|
-| is_simple 字段 | ✓ 已添加到 TensorMapEntryEx |
-| hybrid 检测函数 | ✓ 已实现（使用 bounding box） |
-| TensorMap 集成 | ✓ lookup 使用 hybrid |
-| 连续 tensor 检测 | ✓ 精确 |
-| 非连续 tensor 检测 | ✓ 保守（无漏报） |
+| 功能 | 状态 | 说明 |
+|------|------|------|
+| Bounding Box 检测 | ✓ 已实现 | 当前方法 |
+| TensorMap 集成 | ✓ 已实现 | lookup 使用 hybrid |
+| is_simple 字段 | ✓ 临时方案 | HBB 实现后可移除 |
+| **HBB 数据结构** | 📋 待实现 | `PTO2LayoutHistory` |
+| **HBB 比较算法** | 📋 待实现 | `pto2_layout_history_overlap()` |
+| **统一处理** | 📋 待实现 | simple=depth1, non-simple=depth>1 |
+
+**迁移计划**：
+
+```
+当前实现:
+  PTO2LogicalTensor {
+      is_contiguous;     // bool
+      min_byte_offset;   // bbox
+      max_byte_offset;
+  }
+
+HBB 实现后:
+  PTO2LogicalTensor {
+      PTO2LayoutHistory layout_history;  // 统一结构
+      // is_contiguous 可通过 depth==1 判断
+      // bbox 可通过 ops[depth-1].view 获取
+  }
+```
